@@ -1,0 +1,7 @@
+node_modules/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+/tmp/
+.DS_Store
+.kiro/

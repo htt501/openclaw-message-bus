@@ -1,0 +1,23 @@
+{
+  "name": "openclaw-message-bus",
+  "version": "1.0.0",
+  "description": "Agent-to-Agent async message bus with SQLite persistence",
+  "type": "module",
+  "main": "index.js",
+  "openclaw": {
+    "extensions": ["./index.js"]
+  },
+  "scripts": {
+    "test": "node --test tests/unit/*.test.js",
+    "test:integration": "node --test tests/integration/*.test.js",
+    "test:all": "node --test tests/unit/*.test.js tests/integration/*.test.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "@sinclair/typebox": "^0.34.0"
+  },
+  "devDependencies": {
+    "fast-check": "^3.0.0"
+  },
+  "license": "MIT"
+}
