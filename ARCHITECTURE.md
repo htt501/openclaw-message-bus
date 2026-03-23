@@ -102,7 +102,7 @@ src/format.js         → 统一返回值格式化
 | content | TEXT | NOT NULL | 消息内容（≤10KB） |
 | ref | TEXT | | 话题链标识 |
 | reply_to | TEXT | | 回复的 msg_id |
-| status | TEXT | DEFAULT 'queued' | queued/processing/delivered/dead_letter/expired |
+| status | TEXT | DEFAULT 'queued' | queued/processing/delivered/completed/failed/dead_letter/expired |
 | retry_count | INTEGER | DEFAULT 0 | 重试次数 |
 | max_retries | INTEGER | DEFAULT 3 | 最大重试次数 |
 | last_error | TEXT | | 最后错误信息 |
@@ -110,6 +110,10 @@ src/format.js         → 统一返回值格式化
 | processing_at | TEXT | | 开始处理时间 |
 | delivered_at | TEXT | | 投递确认时间 |
 | expired_at | TEXT | | 过期时间 |
+| completed_at | TEXT | | v1.1: 完成时间 |
+| failed_at | TEXT | | v1.1: 失败时间 |
+| result | TEXT | | v1.1: 完成结果摘要（≤2KB） |
+| fail_reason | TEXT | | v1.1: 失败原因（≤2KB） |
 
 ### 索引
 
@@ -119,16 +123,34 @@ src/format.js         → 统一返回值格式化
 | idx_type | (type) | 按类型筛选 |
 | idx_created | (created_at) | 过期清理 |
 
-## 6. 消息生命周期
+## 6. 消息生命周期 (v1.1)
 
 ```
 queued → delivered (bus_read 直接标记)
-queued → expired (24h 未读)
+delivered → processing (bus_ack status=processing)
+delivered → completed (bus_ack status=completed, 可跳过 processing)
+delivered → failed (bus_ack status=failed)
+processing → completed (bus_ack status=completed)
+processing → failed (bus_ack status=failed)
 processing → queued (超时重试, 最多 3 次)
 processing → dead_letter (重试耗尽)
+queued → expired (24h 未读)
+delivered[task] → expired (2h 未处理)
 dead_letter → expired (24h 后)
+completed → deleted (7 天后清理)
+failed → deleted (7 天后清理)
 delivered → deleted (7 天后清理)
 ```
+
+### 终态保护
+
+| 当前状态 | 尝试操作 | 返回错误码 |
+|----------|----------|------------|
+| completed | 任何 ack | ALREADY_COMPLETED |
+| failed | 任何 ack | ALREADY_FAILED |
+| expired | 任何 ack | MSG_EXPIRED |
+| dead_letter | 任何 ack | MSG_DEAD_LETTER |
+| queued | ack(processing) | INVALID_TRANSITION |
 
 ## 7. 降级策略
 
@@ -147,8 +169,8 @@ bus_send
 |------|------|------|
 | 5 min | revertTimedOut | processing 超时 10min → queued（retry<3）或 dead_letter |
 | 5 min | recoverFallback | /tmp/bus-fallback/ → SQLite 回补 |
-| 1 hour | cleanExpired | delivered 7天删除；queued/dead_letter 24h → expired |
-| 1 hour | logMetrics | 输出统计 + 数据库大小告警（>50MB） |
+| 1 hour | cleanExpired | delivered/completed/failed 7天删除；queued/dead_letter 24h → expired；delivered task 2h → expired |
+| 1 hour | logMetrics | 输出统计（含 completed/failed 计数）+ 数据库大小告警（>50MB） |
 
 ## 9. 错误码
 
@@ -157,7 +179,12 @@ bus_send
 | INVALID_PARAM | to/type/priority 不合法，content 超 10KB |
 | FALLBACK_FAILED | SQLite 和文件系统同时失败 |
 | MSG_NOT_FOUND | msg_id 不存在 |
-| ALREADY_ACKED | 对已 delivered 的消息重复 ack |
+| ALREADY_COMPLETED | 对已 completed 的消息重复 ack |
+| ALREADY_FAILED | 对已 failed 的消息重复 ack |
+| MSG_EXPIRED | 对已 expired 的消息 ack |
+| MSG_DEAD_LETTER | 对 dead_letter 消息 ack |
+| INVALID_STATUS | 未知的目标状态 |
+| INVALID_TRANSITION | 非法状态转换（如 queued → processing） |
 | ROUND_LIMIT | 话题链超过 10 轮 |
 
 ## 10. 技术栈
@@ -187,3 +214,17 @@ bus_send
 | 话题链追踪 | 无 | ref + 10 轮限制 | 防循环 |
 | Agent 列表 | 硬编码 | config 驱动 | 多环境部署 |
 | 通知配置 | 硬编码 | config 驱动 | 同上 |
+
+## 13. v1.1 变更摘要
+
+| 变更项 | v1.0 | v1.1 |
+|--------|------|------|
+| bus_ack | 幂等确认（delivered→delivered） | 状态机转换（processing/completed/failed） |
+| 新字段 | — | completed_at, failed_at, result, fail_reason |
+| bus_read | 设置 processing_at | 仅设置 delivered_at |
+| delivered task 超时 | 无 | 2h 自动 expired |
+| completed/failed 清理 | 无 | 7 天自动删除 |
+| 数据库迁移 | 无 | user_version pragma 机制 |
+| result/reason 截断 | 无 | ≤2KB 自动截断 |
+| 终态保护 | 无 | ALREADY_COMPLETED/ALREADY_FAILED/MSG_EXPIRED/MSG_DEAD_LETTER |
+| 向后兼容 | — | bus_ack 不传 status 默认 completed |

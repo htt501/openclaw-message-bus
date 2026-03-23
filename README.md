@@ -112,11 +112,20 @@ bus_read({
 // Messages are atomically marked as 'delivered' on read
 ```
 
-### bus_ack — Acknowledge a message
+### bus_ack — Acknowledge / transition message status (v1.1)
 
 ```js
+// Mark as processing (optional intermediate step)
+bus_ack({ msg_id: "msg_main_1234_00a1", status: "processing" })
+
+// Mark as completed with result summary
+bus_ack({ msg_id: "msg_main_1234_00a1", status: "completed", result: "deployed ok" })
+
+// Mark as failed with reason
+bus_ack({ msg_id: "msg_main_1234_00a1", status: "failed", reason: "permission denied" })
+
+// Backward compatible: no status = completed
 bus_ack({ msg_id: "msg_main_1234_00a1" })
-// Idempotent: already-acked messages return ALREADY_ACKED
 ```
 
 ### bus_status — Query message status
@@ -126,14 +135,22 @@ bus_status({ msg_id: "msg_main_1234_00a1" })
 // Returns full message record including status, timestamps, retry count
 ```
 
-## Message Lifecycle
+## Message Lifecycle (v1.1)
 
 ```
 queued → delivered (on bus_read)
-queued → expired (after 24h)
+delivered → processing (bus_ack status=processing)
+delivered → completed (bus_ack status=completed, skip processing)
+delivered → failed (bus_ack status=failed)
+processing → completed (bus_ack status=completed)
+processing → failed (bus_ack status=failed)
 processing → queued (timeout retry, up to 3x)
 processing → dead_letter (max retries exceeded)
+queued → expired (after 24h)
+delivered[task] → expired (after 2h)
 dead_letter → expired (after 24h)
+completed → deleted (after 7 days)
+failed → deleted (after 7 days)
 delivered → deleted (after 7 days)
 ```
 
@@ -180,9 +197,23 @@ openclaw-message-bus/
 ## Development
 
 ```bash
-npm test                    # unit + property tests
+npm test                    # unit tests
 npm run test:integration    # integration tests
+npm run test:all            # all tests
 ```
+
+## Changelog
+
+### v1.1.0 — Extended State Machine
+
+- `bus_ack` now supports `status` param: `processing` / `completed` / `failed`
+- New fields: `completed_at`, `failed_at`, `result` (≤2KB), `fail_reason` (≤2KB)
+- Delivered task messages auto-expire after 2h
+- Completed/failed messages auto-cleaned after 7 days
+- Database migration mechanism (`user_version` pragma) for v1.0 → v1.1
+- Backward compatible: `bus_ack` without `status` defaults to `completed`
+- Terminal state guards: ALREADY_COMPLETED, ALREADY_FAILED, MSG_EXPIRED, MSG_DEAD_LETTER
+- Invalid transition detection: INVALID_TRANSITION error code
 
 ## License
 

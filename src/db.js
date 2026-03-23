@@ -1,6 +1,7 @@
 /**
- * SQLite 操作层
+ * SQLite 操作层 v1.1
  * 封装所有数据库读写操作，使用 better-sqlite3 同步 API
+ * v1.1: 扩展状态机 (processing/completed/failed) + migration 机制
  */
 
 import Database from 'better-sqlite3';
@@ -23,13 +24,60 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL,
   processing_at TEXT,
   delivered_at TEXT,
-  expired_at TEXT
+  expired_at TEXT,
+  completed_at TEXT,
+  failed_at TEXT,
+  result TEXT,
+  fail_reason TEXT
 );`;
 
 const CREATE_INDEXES_SQL = `
 CREATE INDEX IF NOT EXISTS idx_to_status ON messages(to_agent, status);
 CREATE INDEX IF NOT EXISTS idx_type ON messages(type);
 CREATE INDEX IF NOT EXISTS idx_created ON messages(created_at);`;
+
+/** v1.1 migration: add columns for existing v1.0 databases */
+const MIGRATIONS = [
+  {
+    version: 2,
+    sqls: [
+      'ALTER TABLE messages ADD COLUMN completed_at TEXT',
+      'ALTER TABLE messages ADD COLUMN failed_at TEXT',
+      'ALTER TABLE messages ADD COLUMN result TEXT',
+      'ALTER TABLE messages ADD COLUMN fail_reason TEXT',
+    ]
+  }
+];
+
+const MAX_RESULT_BYTES = 2048;
+
+function truncate(str, max) {
+  if (!str) return str;
+  if (Buffer.byteLength(str, 'utf8') <= max) return str;
+  // Truncate by chars until under byte limit
+  let s = str;
+  while (Buffer.byteLength(s, 'utf8') > max - 3) {
+    s = s.slice(0, s.length - 1);
+  }
+  return s + '...';
+}
+
+/**
+ * Run migrations on an existing database
+ */
+function runMigrations(db) {
+  const currentVersion = db.pragma('user_version', { simple: true });
+  for (const m of MIGRATIONS) {
+    if (currentVersion < m.version) {
+      for (const sql of m.sqls) {
+        try { db.exec(sql); } catch (e) {
+          if (!e.message.includes('duplicate column')) throw e;
+        }
+      }
+      db.pragma(`user_version = ${m.version}`);
+    }
+  }
+}
 
 /**
  * 初始化数据库并返回操作方法对象
@@ -46,6 +94,7 @@ export function initDb(stateDir, logger) {
 
   db.exec(CREATE_TABLE_SQL);
   db.exec(CREATE_INDEXES_SQL);
+  runMigrations(db);
 
   logger.info(`SQLite initialized at ${dbPath}`);
 
@@ -56,9 +105,10 @@ export function initDb(stateDir, logger) {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
   `);
 
+  // v1.1: bus_read no longer sets processing_at (only delivered_at)
   const stmtRead = db.prepare(`
     UPDATE messages
-    SET status = 'delivered', delivered_at = ?, processing_at = ?
+    SET status = 'delivered', delivered_at = ?
     WHERE msg_id IN (
       SELECT msg_id FROM messages
       WHERE to_agent = ? AND status = 'queued'
@@ -72,10 +122,20 @@ export function initDb(stateDir, logger) {
     RETURNING msg_id, from_agent, type, priority, content, ref, created_at
   `);
 
-  const stmtAck = db.prepare(`
-    UPDATE messages
-    SET status = 'delivered', delivered_at = ?
-    WHERE msg_id = ? AND status = 'processing'
+  // v1.1: ack transitions
+  const stmtAckProcessing = db.prepare(`
+    UPDATE messages SET status = 'processing', processing_at = ?
+    WHERE msg_id = ? AND status = 'delivered'
+  `);
+
+  const stmtAckCompleted = db.prepare(`
+    UPDATE messages SET status = 'completed', completed_at = ?, result = ?
+    WHERE msg_id = ? AND status IN ('delivered', 'processing')
+  `);
+
+  const stmtAckFailed = db.prepare(`
+    UPDATE messages SET status = 'failed', failed_at = ?, fail_reason = ?
+    WHERE msg_id = ? AND status IN ('delivered', 'processing')
   `);
 
   const stmtGetMessage = db.prepare(`
@@ -99,10 +159,28 @@ export function initDb(stateDir, logger) {
     WHERE status = 'delivered' AND delivered_at < ?
   `);
 
+  // v1.1: clean completed/failed older than 7 days
+  const stmtDeleteCompleted = db.prepare(`
+    DELETE FROM messages
+    WHERE status = 'completed' AND completed_at < ?
+  `);
+
+  const stmtDeleteFailed = db.prepare(`
+    DELETE FROM messages
+    WHERE status = 'failed' AND failed_at < ?
+  `);
+
   const stmtExpireQueued = db.prepare(`
     UPDATE messages
     SET status = 'expired', expired_at = ?
     WHERE status = 'queued' AND created_at < ?
+  `);
+
+  // v1.1: expire delivered tasks older than 2h
+  const stmtExpireDeliveredTasks = db.prepare(`
+    UPDATE messages
+    SET status = 'expired', expired_at = ?
+    WHERE status = 'delivered' AND type = 'task' AND delivered_at < ?
   `);
 
   const stmtExpireDeadLetter = db.prepare(`
@@ -111,12 +189,15 @@ export function initDb(stateDir, logger) {
     WHERE status = 'dead_letter' AND created_at < ?
   `);
 
+  // v1.1: metrics includes completed/failed
   const stmtMetrics = db.prepare(`
     SELECT
       COUNT(*) as total,
       COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) as queued,
       COALESCE(SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END), 0) as processing,
       COALESCE(SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END), 0) as delivered,
+      COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) as completed,
+      COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) as failed,
       COALESCE(SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END), 0) as dead_letter,
       COALESCE(SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END), 0) as expired,
       AVG(CASE WHEN delivered_at IS NOT NULL
@@ -132,10 +213,6 @@ export function initDb(stateDir, logger) {
   // --- Operation methods ---
 
   return {
-    /**
-     * 插入消息
-     * @param {object} data - 消息数据
-     */
     insertMessage(data) {
       stmtInsert.run(
         data.msg_id,
@@ -150,65 +227,70 @@ export function initDb(stateDir, logger) {
       );
     },
 
-    /**
-     * 原子读取消息：选取 queued 消息并标记为 processing
-     * @param {string} toAgent - 接收者 Agent ID
-     * @param {string|null} from - 筛选发送者
-     * @param {string|null} type - 筛选消息类型
-     * @param {number} limit - 最大返回条数
-     * @returns {Array} 消息数组
-     */
     readMessages(toAgent, from, type, limit) {
       const now = new Date().toISOString();
       const rows = stmtRead.all(
-        now,
         now,
         toAgent,
         from ?? null, from ?? null,
         type ?? null, type ?? null,
         limit
       );
-      // RETURNING 不保证顺序，按 priority + created_at 排序
       const pMap = { P0: 0, P1: 1, P2: 2 };
       rows.sort((a, b) => (pMap[a.priority] ?? 2) - (pMap[b.priority] ?? 2) || a.created_at.localeCompare(b.created_at));
       return rows;
     },
 
     /**
-     * 确认消息：processing → delivered
-     * @param {string} msgId - 消息 ID
-     * @returns {{ msg_id: string, status: string }}
+     * v1.1: 确认消息状态转换
+     * @param {string} msgId
+     * @param {object} opts - { status?, result?, reason? }
+     * @returns {{ msg_id, status, prev_status? } | { msg_id, error }}
      */
-    ackMessage(msgId) {
+    ackMessage(msgId, opts = {}) {
+      const targetStatus = opts.status || 'completed';
       const now = new Date().toISOString();
-      const result = stmtAck.run(now, msgId);
 
-      if (result.changes > 0) {
-        return { msg_id: msgId, status: 'delivered' };
-      }
-
-      // 区分 ALREADY_ACKED 和 MSG_NOT_FOUND
+      // Check current state first for better error messages
       const msg = stmtGetMessage.get(msgId);
-      if (msg && msg.status === 'delivered') {
-        return { msg_id: msgId, status: 'ALREADY_ACKED' };
+      if (!msg) return null; // MSG_NOT_FOUND
+
+      // Terminal states
+      if (msg.status === 'completed') return { msg_id: msgId, status: 'ALREADY_COMPLETED' };
+      if (msg.status === 'failed') return { msg_id: msgId, status: 'ALREADY_FAILED' };
+      if (msg.status === 'expired') return { msg_id: msgId, status: 'MSG_EXPIRED' };
+      if (msg.status === 'dead_letter') return { msg_id: msgId, status: 'MSG_DEAD_LETTER' };
+
+      let result;
+      if (targetStatus === 'processing') {
+        result = stmtAckProcessing.run(now, msgId);
+        if (result.changes > 0) {
+          return { msg_id: msgId, status: 'processing', prev_status: msg.status };
+        }
+      } else if (targetStatus === 'completed') {
+        const truncResult = truncate(opts.result ?? null, MAX_RESULT_BYTES);
+        result = stmtAckCompleted.run(now, truncResult, msgId);
+        if (result.changes > 0) {
+          return { msg_id: msgId, status: 'completed', prev_status: msg.status, result: truncResult };
+        }
+      } else if (targetStatus === 'failed') {
+        const truncReason = truncate(opts.reason ?? null, MAX_RESULT_BYTES);
+        result = stmtAckFailed.run(now, truncReason, msgId);
+        if (result.changes > 0) {
+          return { msg_id: msgId, status: 'failed', prev_status: msg.status, fail_reason: truncReason };
+        }
+      } else {
+        return { msg_id: msgId, status: 'INVALID_STATUS', error: `Unknown status: ${targetStatus}` };
       }
-      return null; // MSG_NOT_FOUND
+
+      // If we get here, the WHERE condition didn't match (invalid transition)
+      return { msg_id: msgId, status: 'INVALID_TRANSITION', error: `Cannot transition from '${msg.status}' to '${targetStatus}'` };
     },
 
-    /**
-     * 查询消息完整记录
-     * @param {string} msgId - 消息 ID
-     * @returns {object|undefined} 消息记录
-     */
     getMessageStatus(msgId) {
       return stmtGetMessage.get(msgId);
     },
 
-    /**
-     * processing 超时回退 + 死信标记
-     * @param {number} timeoutMinutes - 超时分钟数
-     * @returns {{ reverted: number, deadLettered: number }}
-     */
     revertTimedOut(timeoutMinutes) {
       const cutoff = new Date(Date.now() - timeoutMinutes * 60 * 1000).toISOString();
       const revertResult = stmtRevertTimedOut.run(cutoff);
@@ -219,57 +301,43 @@ export function initDb(stateDir, logger) {
       };
     },
 
-    /**
-     * 过期清理
-     * @returns {{ deletedDelivered: number, expiredQueued: number, expiredDeadLetter: number }}
-     */
     cleanExpired() {
       const now = new Date();
       const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
       const twentyFourHoursAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+      const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString();
       const nowIso = now.toISOString();
 
-      const delResult = stmtDeleteDelivered.run(sevenDaysAgo);
-      const expQueuedResult = stmtExpireQueued.run(nowIso, twentyFourHoursAgo);
-      const expDeadResult = stmtExpireDeadLetter.run(nowIso, twentyFourHoursAgo);
+      const delDelivered = stmtDeleteDelivered.run(sevenDaysAgo);
+      const delCompleted = stmtDeleteCompleted.run(sevenDaysAgo);
+      const delFailed = stmtDeleteFailed.run(sevenDaysAgo);
+      const expQueued = stmtExpireQueued.run(nowIso, twentyFourHoursAgo);
+      const expDeliveredTasks = stmtExpireDeliveredTasks.run(nowIso, twoHoursAgo);
+      const expDeadLetter = stmtExpireDeadLetter.run(nowIso, twentyFourHoursAgo);
 
       return {
-        deletedDelivered: delResult.changes,
-        expiredQueued: expQueuedResult.changes,
-        expiredDeadLetter: expDeadResult.changes
+        deletedDelivered: delDelivered.changes,
+        deletedCompleted: delCompleted.changes,
+        deletedFailed: delFailed.changes,
+        expiredQueued: expQueued.changes,
+        expiredDeliveredTasks: expDeliveredTasks.changes,
+        expiredDeadLetter: expDeadLetter.changes
       };
     },
 
-    /**
-     * 指标查询
-     * @returns {object} 指标数据
-     */
     getMetrics() {
       return stmtMetrics.get();
     },
 
-    /**
-     * 统计话题链中的消息数量
-     * @param {string} threadRef - 话题 ref 标识
-     * @returns {number} 消息数量
-     */
     countThreadMessages(threadRef) {
       const row = stmtCountThread.get(threadRef);
       return row?.count ?? 0;
     },
 
-    /**
-     * 返回数据库文件路径
-     * @returns {string}
-     */
     getDbPath() {
       return dbPath;
     },
 
-    /**
-     * 获取底层数据库实例（仅用于测试）
-     * @returns {Database}
-     */
     getDb() {
       return db;
     }

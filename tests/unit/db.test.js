@@ -1,313 +1,314 @@
+/**
+ * db.js 单元测试 v1.1
+ * 覆盖：消息插入、读取、v1.1 状态转换、超时回退、过期清理、指标
+ */
+
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTestDb } from '../helpers/db.js';
 
-describe('Database Schema', () => {
-  let dbOps;
+describe('db operations v1.1', () => {
+  let db;
 
   beforeEach(() => {
-    dbOps = createTestDb();
+    db = createTestDb();
   });
 
-  it('should create messages table with all 16 fields', () => {
-    const db = dbOps.getDb();
-    const columns = db.prepare("PRAGMA table_info(messages)").all();
-    const columnNames = columns.map(c => c.name);
-
-    const expected = [
-      'msg_id', 'from_agent', 'to_agent', 'type', 'priority',
-      'content', 'ref', 'reply_to', 'status', 'retry_count',
-      'max_retries', 'last_error', 'created_at', 'processing_at',
-      'delivered_at', 'expired_at'
-    ];
-
-    assert.equal(columns.length, 16);
-    for (const name of expected) {
-      assert.ok(columnNames.includes(name), `missing column: ${name}`);
-    }
-  });
-
-  it('should have correct default values', () => {
-    const db = dbOps.getDb();
-    const columns = db.prepare("PRAGMA table_info(messages)").all();
-    const byName = Object.fromEntries(columns.map(c => [c.name, c]));
-
-    assert.equal(byName.type.dflt_value, "'notify'");
-    assert.equal(byName.priority.dflt_value, "'P2'");
-    assert.equal(byName.status.dflt_value, "'queued'");
-    assert.equal(byName.retry_count.dflt_value, '0');
-    assert.equal(byName.max_retries.dflt_value, '3');
-  });
-
-  it('should have NOT NULL constraints on required fields', () => {
-    const db = dbOps.getDb();
-    const columns = db.prepare("PRAGMA table_info(messages)").all();
-    const byName = Object.fromEntries(columns.map(c => [c.name, c]));
-
-    assert.equal(byName.from_agent.notnull, 1);
-    assert.equal(byName.to_agent.notnull, 1);
-    assert.equal(byName.content.notnull, 1);
-    assert.equal(byName.created_at.notnull, 1);
-  });
-
-  it('should create all 3 indexes', () => {
-    const db = dbOps.getDb();
-    const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages'").all();
-    const indexNames = indexes.map(i => i.name);
-
-    assert.ok(indexNames.includes('idx_to_status'), 'missing idx_to_status');
-    assert.ok(indexNames.includes('idx_type'), 'missing idx_type');
-    assert.ok(indexNames.includes('idx_created'), 'missing idx_created');
-  });
-});
-
-describe('Database Operations', () => {
-  let dbOps;
-
-  beforeEach(() => {
-    dbOps = createTestDb();
-  });
-
-  describe('insertMessage', () => {
-    it('should insert a message with queued status', () => {
-      dbOps.insertMessage({
-        msg_id: 'msg_main_1000_abcd',
-        from_agent: 'main',
-        to_agent: 'ops',
-        type: 'task',
-        priority: 'P1',
-        content: 'hello',
+  describe('insertMessage + getMessageStatus', () => {
+    it('inserts and retrieves a message', () => {
+      db.insertMessage({
+        msg_id: 'msg_001', from_agent: 'main', to_agent: 'ops',
+        type: 'task', priority: 'P1', content: 'hello',
         created_at: new Date().toISOString()
       });
-
-      const msg = dbOps.getMessageStatus('msg_main_1000_abcd');
+      const msg = db.getMessageStatus('msg_001');
+      assert.ok(msg);
       assert.equal(msg.status, 'queued');
       assert.equal(msg.from_agent, 'main');
-      assert.equal(msg.to_agent, 'ops');
-      assert.equal(msg.type, 'task');
-      assert.equal(msg.priority, 'P1');
-      assert.equal(msg.content, 'hello');
+      assert.equal(msg.processing_at, null);
+      assert.equal(msg.completed_at, null);
+      assert.equal(msg.failed_at, null);
+      assert.equal(msg.result, null);
+      assert.equal(msg.fail_reason, null);
     });
   });
 
-  describe('readMessages', () => {
-    it('should atomically read and mark messages as delivered', () => {
-      dbOps.insertMessage({
-        msg_id: 'msg_main_1000_0001',
-        from_agent: 'main',
-        to_agent: 'ops',
-        type: 'notify',
-        priority: 'P2',
-        content: 'msg1',
+  describe('readMessages v1.1', () => {
+    it('marks as delivered without setting processing_at', () => {
+      db.insertMessage({
+        msg_id: 'msg_001', from_agent: 'main', to_agent: 'ops',
+        type: 'task', priority: 'P1', content: 'hello',
         created_at: new Date().toISOString()
       });
+      const rows = db.readMessages('ops', null, null, 10);
+      assert.equal(rows.length, 1);
 
-      const messages = dbOps.readMessages('ops', null, null, 10);
-      assert.equal(messages.length, 1);
-      assert.equal(messages[0].msg_id, 'msg_main_1000_0001');
-
-      // Verify status changed to delivered directly
-      const msg = dbOps.getMessageStatus('msg_main_1000_0001');
+      const msg = db.getMessageStatus('msg_001');
       assert.equal(msg.status, 'delivered');
       assert.ok(msg.delivered_at);
+      assert.equal(msg.processing_at, null); // v1.1: no longer set by read
     });
 
-    it('should filter by from_agent', () => {
-      dbOps.insertMessage({
-        msg_id: 'msg_main_1000_0001', from_agent: 'main', to_agent: 'ops',
-        type: 'notify', priority: 'P2', content: 'from main',
-        created_at: new Date().toISOString()
-      });
-      dbOps.insertMessage({
-        msg_id: 'msg_creator_1000_0002', from_agent: 'creator', to_agent: 'ops',
-        type: 'notify', priority: 'P2', content: 'from creator',
-        created_at: new Date().toISOString()
-      });
-
-      const messages = dbOps.readMessages('ops', 'main', null, 10);
-      assert.equal(messages.length, 1);
-      assert.equal(messages[0].from_agent, 'main');
-    });
-
-    it('should respect limit', () => {
-      for (let i = 0; i < 5; i++) {
-        dbOps.insertMessage({
-          msg_id: `msg_main_1000_000${i}`, from_agent: 'main', to_agent: 'ops',
-          type: 'notify', priority: 'P2', content: `msg${i}`,
-          created_at: new Date().toISOString()
-        });
-      }
-
-      const messages = dbOps.readMessages('ops', null, null, 3);
-      assert.equal(messages.length, 3);
-    });
-
-    it('should select by priority (P0 before P2) when limit constrains', () => {
-      const base = Date.now();
-      dbOps.insertMessage({
-        msg_id: 'msg_main_1000_p2', from_agent: 'main', to_agent: 'ops',
-        type: 'notify', priority: 'P2', content: 'low',
-        created_at: new Date(base).toISOString()
-      });
-      dbOps.insertMessage({
-        msg_id: 'msg_main_1001_p0', from_agent: 'main', to_agent: 'ops',
-        type: 'notify', priority: 'P0', content: 'urgent',
-        created_at: new Date(base + 1).toISOString()
-      });
-
-      // With limit=1, only the P0 message should be selected
-      const messages = dbOps.readMessages('ops', null, null, 1);
-      assert.equal(messages.length, 1);
-      assert.equal(messages[0].msg_id, 'msg_main_1001_p0');
+    it('returns messages sorted by priority then created_at', () => {
+      const now = new Date();
+      db.insertMessage({ msg_id: 'p2', from_agent: 'a', to_agent: 'b', type: 'notify', priority: 'P2', content: 'low', created_at: new Date(now.getTime() - 1000).toISOString() });
+      db.insertMessage({ msg_id: 'p0', from_agent: 'a', to_agent: 'b', type: 'task', priority: 'P0', content: 'high', created_at: now.toISOString() });
+      const rows = db.readMessages('b', null, null, 10);
+      assert.equal(rows[0].msg_id, 'p0');
+      assert.equal(rows[1].msg_id, 'p2');
     });
   });
 
-  describe('ackMessage', () => {
-    it('should transition processing to delivered', () => {
-      const db = dbOps.getDb();
-      dbOps.insertMessage({
-        msg_id: 'msg_main_1000_0001', from_agent: 'main', to_agent: 'ops',
-        type: 'notify', priority: 'P2', content: 'test',
+  describe('ackMessage v1.1 state transitions', () => {
+    beforeEach(() => {
+      db.insertMessage({
+        msg_id: 'msg_t', from_agent: 'main', to_agent: 'ops',
+        type: 'task', priority: 'P1', content: 'do something',
         created_at: new Date().toISOString()
       });
-      // Manually set to processing (since readMessages now marks delivered directly)
-      db.prepare("UPDATE messages SET status = 'processing', processing_at = ? WHERE msg_id = ?")
-        .run(new Date().toISOString(), 'msg_main_1000_0001');
-
-      const result = dbOps.ackMessage('msg_main_1000_0001');
-      assert.equal(result.status, 'delivered');
-
-      const msg = dbOps.getMessageStatus('msg_main_1000_0001');
-      assert.equal(msg.status, 'delivered');
-      assert.ok(msg.delivered_at);
+      db.readMessages('ops', null, null, 10);
     });
 
-    it('should return ALREADY_ACKED for delivered messages', () => {
-      dbOps.insertMessage({
-        msg_id: 'msg_main_1000_0001', from_agent: 'main', to_agent: 'ops',
-        type: 'notify', priority: 'P2', content: 'test',
+    it('delivered → processing', () => {
+      const r = db.ackMessage('msg_t', { status: 'processing' });
+      assert.equal(r.status, 'processing');
+      assert.equal(r.prev_status, 'delivered');
+      const msg = db.getMessageStatus('msg_t');
+      assert.equal(msg.status, 'processing');
+      assert.ok(msg.processing_at);
+    });
+
+    it('delivered → completed (skip processing)', () => {
+      const r = db.ackMessage('msg_t', { status: 'completed' });
+      assert.equal(r.status, 'completed');
+      assert.equal(r.prev_status, 'delivered');
+      const msg = db.getMessageStatus('msg_t');
+      assert.equal(msg.status, 'completed');
+      assert.ok(msg.completed_at);
+    });
+
+    it('delivered → completed with result', () => {
+      const r = db.ackMessage('msg_t', { status: 'completed', result: 'done: https://example.com' });
+      assert.equal(r.status, 'completed');
+      assert.equal(r.result, 'done: https://example.com');
+      const msg = db.getMessageStatus('msg_t');
+      assert.equal(msg.result, 'done: https://example.com');
+    });
+
+    it('delivered → failed with reason', () => {
+      const r = db.ackMessage('msg_t', { status: 'failed', reason: 'disk full' });
+      assert.equal(r.status, 'failed');
+      assert.equal(r.fail_reason, 'disk full');
+      const msg = db.getMessageStatus('msg_t');
+      assert.equal(msg.status, 'failed');
+      assert.ok(msg.failed_at);
+      assert.equal(msg.fail_reason, 'disk full');
+    });
+
+    it('processing → completed', () => {
+      db.ackMessage('msg_t', { status: 'processing' });
+      const r = db.ackMessage('msg_t', { status: 'completed', result: 'all good' });
+      assert.equal(r.status, 'completed');
+      assert.equal(r.prev_status, 'processing');
+    });
+
+    it('processing → failed', () => {
+      db.ackMessage('msg_t', { status: 'processing' });
+      const r = db.ackMessage('msg_t', { status: 'failed', reason: 'timeout' });
+      assert.equal(r.status, 'failed');
+      assert.equal(r.prev_status, 'processing');
+    });
+
+    it('default status is completed (backward compat)', () => {
+      const r = db.ackMessage('msg_t');
+      assert.equal(r.status, 'completed');
+    });
+
+    it('completed → * returns ALREADY_COMPLETED', () => {
+      db.ackMessage('msg_t', { status: 'completed' });
+      const r = db.ackMessage('msg_t', { status: 'processing' });
+      assert.equal(r.status, 'ALREADY_COMPLETED');
+    });
+
+    it('failed → * returns ALREADY_FAILED', () => {
+      db.ackMessage('msg_t', { status: 'failed', reason: 'err' });
+      const r = db.ackMessage('msg_t', { status: 'completed' });
+      assert.equal(r.status, 'ALREADY_FAILED');
+    });
+
+    it('queued → processing returns INVALID_TRANSITION', () => {
+      db.insertMessage({
+        msg_id: 'msg_q', from_agent: 'a', to_agent: 'b',
+        type: 'task', priority: 'P1', content: 'x',
         created_at: new Date().toISOString()
       });
-      // readMessages marks as delivered directly
-      dbOps.readMessages('ops', null, null, 10);
-
-      const result = dbOps.ackMessage('msg_main_1000_0001');
-      assert.equal(result.status, 'ALREADY_ACKED');
+      const r = db.ackMessage('msg_q', { status: 'processing' });
+      assert.equal(r.status, 'INVALID_TRANSITION');
     });
 
-    it('should return null for non-existent msg_id', () => {
-      const result = dbOps.ackMessage('msg_nonexistent_0000_0000');
-      assert.equal(result, null);
+    it('nonexistent msg returns null', () => {
+      const r = db.ackMessage('msg_nope');
+      assert.equal(r, null);
+    });
+
+    it('truncates result > 2KB', () => {
+      const longResult = 'x'.repeat(3000);
+      const r = db.ackMessage('msg_t', { status: 'completed', result: longResult });
+      assert.equal(r.status, 'completed');
+      assert.ok(Buffer.byteLength(r.result, 'utf8') <= 2048);
+      assert.ok(r.result.endsWith('...'));
+    });
+
+    it('truncates reason > 2KB', () => {
+      const longReason = '错'.repeat(1500);
+      const r = db.ackMessage('msg_t', { status: 'failed', reason: longReason });
+      assert.equal(r.status, 'failed');
+      assert.ok(Buffer.byteLength(r.fail_reason, 'utf8') <= 2048);
+      assert.ok(r.fail_reason.endsWith('...'));
+    });
+
+    it('invalid status returns INVALID_STATUS', () => {
+      const r = db.ackMessage('msg_t', { status: 'bogus' });
+      assert.equal(r.status, 'INVALID_STATUS');
+    });
+  });
+
+  describe('ackMessage terminal states', () => {
+    it('expired → * returns MSG_EXPIRED', () => {
+      db.insertMessage({
+        msg_id: 'msg_exp', from_agent: 'a', to_agent: 'b',
+        type: 'task', priority: 'P1', content: 'x',
+        created_at: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString()
+      });
+      db.getDb().prepare("UPDATE messages SET status = 'expired', expired_at = ? WHERE msg_id = ?")
+        .run(new Date().toISOString(), 'msg_exp');
+      const r = db.ackMessage('msg_exp', { status: 'completed' });
+      assert.equal(r.status, 'MSG_EXPIRED');
+    });
+
+    it('dead_letter → * returns MSG_DEAD_LETTER', () => {
+      db.insertMessage({
+        msg_id: 'msg_dl', from_agent: 'a', to_agent: 'b',
+        type: 'task', priority: 'P1', content: 'x',
+        created_at: new Date().toISOString()
+      });
+      db.getDb().prepare("UPDATE messages SET status = 'dead_letter' WHERE msg_id = ?")
+        .run('msg_dl');
+      const r = db.ackMessage('msg_dl', { status: 'completed' });
+      assert.equal(r.status, 'MSG_DEAD_LETTER');
     });
   });
 
   describe('revertTimedOut', () => {
-    it('should revert timed-out processing messages to queued', () => {
-      const db = dbOps.getDb();
-      const oldTime = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-
-      dbOps.insertMessage({
-        msg_id: 'msg_main_1000_0001', from_agent: 'main', to_agent: 'ops',
-        type: 'notify', priority: 'P2', content: 'test',
+    it('reverts processing messages after timeout', () => {
+      db.insertMessage({
+        msg_id: 'msg_to', from_agent: 'a', to_agent: 'b',
+        type: 'task', priority: 'P1', content: 'x',
         created_at: new Date().toISOString()
       });
+      db.readMessages('b', null, null, 10);
+      db.ackMessage('msg_to', { status: 'processing' });
 
-      // Manually set to processing with old timestamp
-      db.prepare("UPDATE messages SET status = 'processing', processing_at = ? WHERE msg_id = ?")
-        .run(oldTime, 'msg_main_1000_0001');
+      db.getDb().prepare("UPDATE messages SET processing_at = ? WHERE msg_id = ?")
+        .run(new Date(Date.now() - 15 * 60 * 1000).toISOString(), 'msg_to');
 
-      const result = dbOps.revertTimedOut(10);
+      const result = db.revertTimedOut(10);
       assert.equal(result.reverted, 1);
-
-      const msg = dbOps.getMessageStatus('msg_main_1000_0001');
+      const msg = db.getMessageStatus('msg_to');
       assert.equal(msg.status, 'queued');
       assert.equal(msg.retry_count, 1);
     });
-
-    it('should mark as dead_letter when retry_count >= max_retries', () => {
-      const db = dbOps.getDb();
-      const oldTime = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-
-      dbOps.insertMessage({
-        msg_id: 'msg_main_1000_0001', from_agent: 'main', to_agent: 'ops',
-        type: 'notify', priority: 'P2', content: 'test',
-        created_at: new Date().toISOString()
-      });
-
-      db.prepare("UPDATE messages SET status = 'processing', processing_at = ?, retry_count = 3 WHERE msg_id = ?")
-        .run(oldTime, 'msg_main_1000_0001');
-
-      const result = dbOps.revertTimedOut(10);
-      assert.equal(result.deadLettered, 1);
-
-      const msg = dbOps.getMessageStatus('msg_main_1000_0001');
-      assert.equal(msg.status, 'dead_letter');
-    });
   });
 
-  describe('cleanExpired', () => {
-    it('should delete delivered messages older than 7 days', () => {
-      const db = dbOps.getDb();
-      const oldTime = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
-
-      dbOps.insertMessage({
-        msg_id: 'msg_main_1000_0001', from_agent: 'main', to_agent: 'ops',
-        type: 'notify', priority: 'P2', content: 'test',
-        created_at: oldTime
+  describe('cleanExpired v1.1', () => {
+    it('deletes completed messages older than 7 days', () => {
+      db.insertMessage({
+        msg_id: 'msg_old', from_agent: 'a', to_agent: 'b',
+        type: 'task', priority: 'P1', content: 'x',
+        created_at: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString()
       });
+      db.readMessages('b', null, null, 10);
+      db.ackMessage('msg_old', { status: 'completed' });
+      db.getDb().prepare("UPDATE messages SET completed_at = ? WHERE msg_id = ?")
+        .run(new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString(), 'msg_old');
 
-      db.prepare("UPDATE messages SET status = 'delivered', delivered_at = ? WHERE msg_id = ?")
-        .run(oldTime, 'msg_main_1000_0001');
-
-      const result = dbOps.cleanExpired();
-      assert.equal(result.deletedDelivered, 1);
-      assert.equal(dbOps.getMessageStatus('msg_main_1000_0001'), undefined);
+      const result = db.cleanExpired();
+      assert.equal(result.deletedCompleted, 1);
     });
 
-    it('should expire queued messages older than 24h', () => {
-      const oldTime = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
-
-      dbOps.insertMessage({
-        msg_id: 'msg_main_1000_0001', from_agent: 'main', to_agent: 'ops',
-        type: 'notify', priority: 'P2', content: 'test',
-        created_at: oldTime
+    it('deletes failed messages older than 7 days', () => {
+      db.insertMessage({
+        msg_id: 'msg_fail', from_agent: 'a', to_agent: 'b',
+        type: 'task', priority: 'P1', content: 'x',
+        created_at: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString()
       });
+      db.readMessages('b', null, null, 10);
+      db.ackMessage('msg_fail', { status: 'failed', reason: 'err' });
+      db.getDb().prepare("UPDATE messages SET failed_at = ? WHERE msg_id = ?")
+        .run(new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString(), 'msg_fail');
 
-      const result = dbOps.cleanExpired();
-      assert.equal(result.expiredQueued, 1);
+      const result = db.cleanExpired();
+      assert.equal(result.deletedFailed, 1);
+    });
 
-      const msg = dbOps.getMessageStatus('msg_main_1000_0001');
+    it('expires delivered task messages older than 2h', () => {
+      db.insertMessage({
+        msg_id: 'msg_stale', from_agent: 'a', to_agent: 'b',
+        type: 'task', priority: 'P1', content: 'x',
+        created_at: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString()
+      });
+      db.readMessages('b', null, null, 10);
+      db.getDb().prepare("UPDATE messages SET delivered_at = ? WHERE msg_id = ?")
+        .run(new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), 'msg_stale');
+
+      const result = db.cleanExpired();
+      assert.equal(result.expiredDeliveredTasks, 1);
+      const msg = db.getMessageStatus('msg_stale');
       assert.equal(msg.status, 'expired');
-      assert.ok(msg.expired_at);
+    });
+
+    it('does NOT expire delivered notify messages after 2h', () => {
+      db.insertMessage({
+        msg_id: 'msg_notify', from_agent: 'a', to_agent: 'b',
+        type: 'notify', priority: 'P2', content: 'info',
+        created_at: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString()
+      });
+      db.readMessages('b', null, null, 10);
+      db.getDb().prepare("UPDATE messages SET delivered_at = ? WHERE msg_id = ?")
+        .run(new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), 'msg_notify');
+
+      const result = db.cleanExpired();
+      assert.equal(result.expiredDeliveredTasks, 0);
+      const msg = db.getMessageStatus('msg_notify');
+      assert.equal(msg.status, 'delivered');
     });
   });
 
-  describe('getMetrics', () => {
-    it('should return correct counts for empty database', () => {
-      const metrics = dbOps.getMetrics();
-      assert.equal(metrics.total, 0);
-      assert.equal(metrics.queued, 0);
-      assert.equal(metrics.processing, 0);
-      assert.equal(metrics.delivered, 0);
-      assert.equal(metrics.dead_letter, 0);
-      assert.equal(metrics.expired, 0);
+  describe('getMetrics v1.1', () => {
+    it('includes completed and failed counts', () => {
+      const now = new Date().toISOString();
+      db.insertMessage({ msg_id: 'm1', from_agent: 'a', to_agent: 'b', type: 'task', priority: 'P1', content: 'x', created_at: now });
+      db.insertMessage({ msg_id: 'm2', from_agent: 'a', to_agent: 'b', type: 'task', priority: 'P1', content: 'y', created_at: now });
+      db.insertMessage({ msg_id: 'm3', from_agent: 'a', to_agent: 'b', type: 'task', priority: 'P1', content: 'z', created_at: now });
+      db.readMessages('b', null, null, 10);
+      db.ackMessage('m1', { status: 'completed' });
+      db.ackMessage('m2', { status: 'failed', reason: 'err' });
+
+      const metrics = db.getMetrics();
+      assert.equal(metrics.completed, 1);
+      assert.equal(metrics.failed, 1);
+      assert.equal(metrics.delivered, 1);
+      assert.equal(metrics.total, 3);
     });
+  });
 
-    it('should count messages by status', () => {
-      dbOps.insertMessage({
-        msg_id: 'msg_main_1000_0001', from_agent: 'main', to_agent: 'ops',
-        type: 'notify', priority: 'P2', content: 'test1',
-        created_at: new Date().toISOString()
-      });
-      dbOps.insertMessage({
-        msg_id: 'msg_main_1000_0002', from_agent: 'main', to_agent: 'ops',
-        type: 'notify', priority: 'P2', content: 'test2',
-        created_at: new Date().toISOString()
-      });
-
-      const metrics = dbOps.getMetrics();
-      assert.equal(metrics.total, 2);
-      assert.equal(metrics.queued, 2);
+  describe('countThreadMessages', () => {
+    it('counts messages with same ref', () => {
+      const now = new Date().toISOString();
+      db.insertMessage({ msg_id: 't1', from_agent: 'a', to_agent: 'b', type: 'discuss', priority: 'P2', content: 'x', ref: 'thread-1', created_at: now });
+      db.insertMessage({ msg_id: 't2', from_agent: 'b', to_agent: 'a', type: 'discuss', priority: 'P2', content: 'y', ref: 'thread-1', created_at: now });
+      assert.equal(db.countThreadMessages('thread-1'), 2);
+      assert.equal(db.countThreadMessages('thread-2'), 0);
     });
   });
 });

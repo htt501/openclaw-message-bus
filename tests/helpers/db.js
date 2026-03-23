@@ -1,10 +1,22 @@
 /**
- * 测试辅助工具：内存数据库工厂
+ * 测试辅助工具：内存数据库工厂 v1.1
  * 使用 :memory: 避免文件系统依赖
- * 接口与 src/db.js 保持一致
+ * 接口与 src/db.js v1.1 保持一致
  */
 
 import Database from 'better-sqlite3';
+
+const MAX_RESULT_BYTES = 2048;
+
+function truncate(str, max) {
+  if (!str) return str;
+  if (Buffer.byteLength(str, 'utf8') <= max) return str;
+  let s = str;
+  while (Buffer.byteLength(s, 'utf8') > max - 3) {
+    s = s.slice(0, s.length - 1);
+  }
+  return s + '...';
+}
 
 const CREATE_TABLE_SQL = `
 CREATE TABLE IF NOT EXISTS messages (
@@ -23,7 +35,11 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL,
   processing_at TEXT,
   delivered_at TEXT,
-  expired_at TEXT
+  expired_at TEXT,
+  completed_at TEXT,
+  failed_at TEXT,
+  result TEXT,
+  fail_reason TEXT
 );`;
 
 const CREATE_INDEXES_SQL = `
@@ -45,7 +61,7 @@ export function createTestDb() {
 
   const stmtRead = db.prepare(`
     UPDATE messages
-    SET status = 'delivered', delivered_at = ?, processing_at = ?
+    SET status = 'delivered', delivered_at = ?
     WHERE msg_id IN (
       SELECT msg_id FROM messages
       WHERE to_agent = ? AND status = 'queued'
@@ -59,10 +75,19 @@ export function createTestDb() {
     RETURNING msg_id, from_agent, type, priority, content, ref, created_at
   `);
 
-  const stmtAck = db.prepare(`
-    UPDATE messages
-    SET status = 'delivered', delivered_at = ?
-    WHERE msg_id = ? AND status = 'processing'
+  const stmtAckProcessing = db.prepare(`
+    UPDATE messages SET status = 'processing', processing_at = ?
+    WHERE msg_id = ? AND status = 'delivered'
+  `);
+
+  const stmtAckCompleted = db.prepare(`
+    UPDATE messages SET status = 'completed', completed_at = ?, result = ?
+    WHERE msg_id = ? AND status IN ('delivered', 'processing')
+  `);
+
+  const stmtAckFailed = db.prepare(`
+    UPDATE messages SET status = 'failed', failed_at = ?, fail_reason = ?
+    WHERE msg_id = ? AND status IN ('delivered', 'processing')
   `);
 
   const stmtGetMessage = db.prepare(`SELECT * FROM messages WHERE msg_id = ?`);
@@ -74,8 +99,7 @@ export function createTestDb() {
   `);
 
   const stmtMarkDeadLetter = db.prepare(`
-    UPDATE messages
-    SET status = 'dead_letter'
+    UPDATE messages SET status = 'dead_letter'
     WHERE status = 'processing' AND processing_at < ? AND retry_count >= max_retries
   `);
 
@@ -83,9 +107,22 @@ export function createTestDb() {
     DELETE FROM messages WHERE status = 'delivered' AND delivered_at < ?
   `);
 
+  const stmtDeleteCompleted = db.prepare(`
+    DELETE FROM messages WHERE status = 'completed' AND completed_at < ?
+  `);
+
+  const stmtDeleteFailed = db.prepare(`
+    DELETE FROM messages WHERE status = 'failed' AND failed_at < ?
+  `);
+
   const stmtExpireQueued = db.prepare(`
     UPDATE messages SET status = 'expired', expired_at = ?
     WHERE status = 'queued' AND created_at < ?
+  `);
+
+  const stmtExpireDeliveredTasks = db.prepare(`
+    UPDATE messages SET status = 'expired', expired_at = ?
+    WHERE status = 'delivered' AND type = 'task' AND delivered_at < ?
   `);
 
   const stmtExpireDeadLetter = db.prepare(`
@@ -99,6 +136,8 @@ export function createTestDb() {
       COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) as queued,
       COALESCE(SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END), 0) as processing,
       COALESCE(SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END), 0) as delivered,
+      COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) as completed,
+      COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) as failed,
       COALESCE(SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END), 0) as dead_letter,
       COALESCE(SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END), 0) as expired,
       AVG(CASE WHEN delivered_at IS NOT NULL
@@ -122,7 +161,7 @@ export function createTestDb() {
 
     readMessages(toAgent, from, type, limit) {
       const now = new Date().toISOString();
-      const rows = stmtRead.all(now, now, toAgent,
+      const rows = stmtRead.all(now, toAgent,
         from ?? null, from ?? null,
         type ?? null, type ?? null, limit
       );
@@ -131,27 +170,39 @@ export function createTestDb() {
       return rows;
     },
 
-    ackMessage(msgId) {
+    ackMessage(msgId, opts = {}) {
+      const targetStatus = opts.status || 'completed';
       const now = new Date().toISOString();
-      const result = stmtAck.run(now, msgId);
-      if (result.changes > 0) {
-        return { msg_id: msgId, status: 'delivered' };
-      }
+
       const msg = stmtGetMessage.get(msgId);
-      if (msg && msg.status === 'delivered') {
-        return { msg_id: msgId, status: 'ALREADY_ACKED' };
+      if (!msg) return null;
+
+      if (msg.status === 'completed') return { msg_id: msgId, status: 'ALREADY_COMPLETED' };
+      if (msg.status === 'failed') return { msg_id: msgId, status: 'ALREADY_FAILED' };
+      if (msg.status === 'expired') return { msg_id: msgId, status: 'MSG_EXPIRED' };
+      if (msg.status === 'dead_letter') return { msg_id: msgId, status: 'MSG_DEAD_LETTER' };
+
+      let result;
+      if (targetStatus === 'processing') {
+        result = stmtAckProcessing.run(now, msgId);
+        if (result.changes > 0) return { msg_id: msgId, status: 'processing', prev_status: msg.status };
+      } else if (targetStatus === 'completed') {
+        const truncResult = truncate(opts.result ?? null, MAX_RESULT_BYTES);
+        result = stmtAckCompleted.run(now, truncResult, msgId);
+        if (result.changes > 0) return { msg_id: msgId, status: 'completed', prev_status: msg.status, result: truncResult };
+      } else if (targetStatus === 'failed') {
+        const truncReason = truncate(opts.reason ?? null, MAX_RESULT_BYTES);
+        result = stmtAckFailed.run(now, truncReason, msgId);
+        if (result.changes > 0) return { msg_id: msgId, status: 'failed', prev_status: msg.status, fail_reason: truncReason };
+      } else {
+        return { msg_id: msgId, status: 'INVALID_STATUS', error: `Unknown status: ${targetStatus}` };
       }
-      return null;
+
+      return { msg_id: msgId, status: 'INVALID_TRANSITION', error: `Cannot transition from '${msg.status}' to '${targetStatus}'` };
     },
 
-    getMessageStatus(msgId) {
-      return stmtGetMessage.get(msgId);
-    },
-
-    countThreadMessages(threadRef) {
-      const row = stmtCountThread.get(threadRef);
-      return row?.count ?? 0;
-    },
+    getMessageStatus(msgId) { return stmtGetMessage.get(msgId); },
+    countThreadMessages(threadRef) { const row = stmtCountThread.get(threadRef); return row?.count ?? 0; },
 
     revertTimedOut(timeoutMinutes) {
       const cutoff = new Date(Date.now() - timeoutMinutes * 60 * 1000).toISOString();
@@ -164,14 +215,23 @@ export function createTestDb() {
       const now = new Date();
       const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
       const twentyFourHoursAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+      const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString();
       const nowIso = now.toISOString();
-      const delResult = stmtDeleteDelivered.run(sevenDaysAgo);
-      const expQueuedResult = stmtExpireQueued.run(nowIso, twentyFourHoursAgo);
-      const expDeadResult = stmtExpireDeadLetter.run(nowIso, twentyFourHoursAgo);
+
+      const delDelivered = stmtDeleteDelivered.run(sevenDaysAgo);
+      const delCompleted = stmtDeleteCompleted.run(sevenDaysAgo);
+      const delFailed = stmtDeleteFailed.run(sevenDaysAgo);
+      const expQueued = stmtExpireQueued.run(nowIso, twentyFourHoursAgo);
+      const expDeliveredTasks = stmtExpireDeliveredTasks.run(nowIso, twoHoursAgo);
+      const expDeadLetter = stmtExpireDeadLetter.run(nowIso, twentyFourHoursAgo);
+
       return {
-        deletedDelivered: delResult.changes,
-        expiredQueued: expQueuedResult.changes,
-        expiredDeadLetter: expDeadResult.changes
+        deletedDelivered: delDelivered.changes,
+        deletedCompleted: delCompleted.changes,
+        deletedFailed: delFailed.changes,
+        expiredQueued: expQueued.changes,
+        expiredDeliveredTasks: expDeliveredTasks.changes,
+        expiredDeadLetter: expDeadLetter.changes
       };
     },
 
