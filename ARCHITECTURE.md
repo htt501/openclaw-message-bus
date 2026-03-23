@@ -56,6 +56,14 @@ bus_send 写入 SQLite 后立即返回，CLI 推送异步执行（fire-and-forge
 
 最终采用 `child_process.exec` 调用 `openclaw agent --agent <to> --message "..."` 方式。
 
+### 3.2.1 Notify 消息内容（v1.1.1 修复）
+
+v1.0 的 notify 消息仅告知 agent "read and process"，导致 agent 只执行 bus_read + bus_ack 就结束，不会用 bus_send 回复发送者（0% 回复率）。
+
+v1.1.1 修改 notify 消息为明确的 4 步指令：bus_read → process → bus_ack(completed) → bus_send(response, reply_to)，并标注 "Step 4 is MANDATORY"。修复后回复率恢复正常。
+
+教训：LLM Agent 的行为完全由指令驱动，notify 消息就是 agent 的"任务指令"，必须明确列出所有期望步骤。
+
 ### 3.3 并发安全
 
 使用 SQLite `UPDATE...RETURNING` 原子操作，在一条 SQL 中完成消息选取和状态标记，保证多 Agent 并发读取时每条消息仅被一个 Agent 获取。
@@ -197,10 +205,11 @@ bus_send
 
 ## 11. 测试覆盖
 
-- 26 个单元测试：db schema、db operations、format、id
-- 21 个集成测试：完整生命周期 + cron 任务
+- 34 个单元测试：db operations v1.1、format、id
+- 11 个集成测试：完整生命周期 + cron 任务 + 错误处理
 - 测试使用内存 SQLite (`:memory:`) + mock logger/runtime
 - bus_send 测试中 notify.enabled=false 避免真实 CLI 调用
+- 实际飞书群测试验证：agent 间 task 分发 + bus_send 回复闭环
 
 ## 12. 需求变更记录
 
@@ -228,3 +237,4 @@ bus_send
 | result/reason 截断 | 无 | ≤2KB 自动截断 |
 | 终态保护 | 无 | ALREADY_COMPLETED/ALREADY_FAILED/MSG_EXPIRED/MSG_DEAD_LETTER |
 | 向后兼容 | — | bus_ack 不传 status 默认 completed |
+| notify 消息 | "read and process" | 明确 4 步指令含强制 bus_send 回复 |

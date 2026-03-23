@@ -156,14 +156,18 @@ delivered → deleted (after 7 days)
 
 ## Agent Rules Template
 
-Copy this to each agent's rules directory (e.g. `~/.openclaw/workspace-{agent}/rules/message-bus.md`):
+Copy this to each agent's SOUL.md and rules directory (e.g. `~/.openclaw/workspace-{agent}/rules/message-bus.md`):
 
 ```markdown
 # Message Bus Rules
 
 1. **On activation, always call bus_read first** — check for pending messages
-2. **After processing a message, call bus_ack** — prevents duplicate delivery
-3. **Use bus_send for agent-to-agent communication** — not direct session messages
+2. **After reading a task message, follow this exact flow:**
+   - bus_ack({ msg_id, status: "processing" })
+   - Execute the task
+   - bus_ack({ msg_id, status: "completed", result: "summary" })
+   - bus_send({ to: sender, content: "detailed result", type: "response", reply_to: msg_id })
+3. **Step 4 (bus_send reply) is MANDATORY** — the sender reads your reply via bus_read
 4. **Use appropriate priority** — P0/P1 for urgent, P2 for normal, P3 for low
 5. **Use reply_to when responding** — maintains thread tracking
 6. **Thread limit is 10 rounds** — escalate if you hit ROUND_LIMIT
@@ -203,6 +207,12 @@ npm run test:all            # all tests
 ```
 
 ## Changelog
+
+### v1.1.1 — Notify Message Fix
+
+- CLI notify message now explicitly instructs target agent to `bus_send` reply back to sender
+- Previous notify only said "read and process", causing 0% reply rate
+- All agent SOUL.md updated with mandatory bus_send reply rule
 
 ### v1.1.0 — Extended State Machine
 
