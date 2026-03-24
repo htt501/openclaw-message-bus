@@ -311,4 +311,66 @@ describe('db operations v1.1', () => {
       assert.equal(db.countThreadMessages('thread-2'), 0);
     });
   });
+
+  describe('findStaleMessages v1.1.2', () => {
+    it('returns delivered/processing task messages', () => {
+      const now = new Date().toISOString();
+      db.insertMessage({ msg_id: 'stale1', from_agent: 'main', to_agent: 'ops', type: 'task', priority: 'P1', content: 'do it', created_at: now });
+      db.insertMessage({ msg_id: 'stale2', from_agent: 'main', to_agent: 'intel', type: 'task', priority: 'P0', content: 'urgent', created_at: now });
+      db.insertMessage({ msg_id: 'notify1', from_agent: 'main', to_agent: 'ops', type: 'notify', priority: 'P2', content: 'info', created_at: now });
+      db.readMessages('ops', null, null, 10);
+      db.readMessages('intel', null, null, 10);
+
+      const stale = db.findStaleMessages();
+      // should include 2 task messages, not the notify
+      assert.equal(stale.length, 2);
+      const ids = stale.map(m => m.msg_id).sort();
+      assert.deepEqual(ids, ['stale1', 'stale2']);
+    });
+
+    it('does not return completed/failed tasks', () => {
+      const now = new Date().toISOString();
+      db.insertMessage({ msg_id: 'done1', from_agent: 'a', to_agent: 'b', type: 'task', priority: 'P1', content: 'x', created_at: now });
+      db.insertMessage({ msg_id: 'fail1', from_agent: 'a', to_agent: 'b', type: 'task', priority: 'P1', content: 'y', created_at: now });
+      db.readMessages('b', null, null, 10);
+      db.ackMessage('done1', { status: 'completed' });
+      db.ackMessage('fail1', { status: 'failed', reason: 'err' });
+
+      const stale = db.findStaleMessages();
+      assert.equal(stale.length, 0);
+    });
+
+    it('includes priority field for threshold filtering', () => {
+      const now = new Date().toISOString();
+      db.insertMessage({ msg_id: 'p0task', from_agent: 'a', to_agent: 'b', type: 'task', priority: 'P0', content: 'x', created_at: now });
+      db.readMessages('b', null, null, 10);
+
+      const stale = db.findStaleMessages();
+      assert.equal(stale.length, 1);
+      assert.equal(stale[0].priority, 'P0');
+    });
+  });
+
+  describe('heartbeat (processing → processing refresh)', () => {
+    it('refreshes processing_at on re-ack processing', () => {
+      const now = new Date().toISOString();
+      db.insertMessage({ msg_id: 'hb1', from_agent: 'a', to_agent: 'b', type: 'task', priority: 'P1', content: 'x', created_at: now });
+      db.readMessages('b', null, null, 10);
+      db.ackMessage('hb1', { status: 'processing' });
+
+      const msg1 = db.getMessageStatus('hb1');
+      const firstProcessingAt = msg1.processing_at;
+
+      // Simulate time passing then heartbeat
+      db.getDb().prepare("UPDATE messages SET processing_at = ? WHERE msg_id = ?")
+        .run(new Date(Date.now() - 5 * 60 * 1000).toISOString(), 'hb1');
+
+      const r = db.ackMessage('hb1', { status: 'processing' });
+      assert.equal(r.status, 'processing');
+      assert.equal(r.prev_status, 'processing');
+
+      const msg2 = db.getMessageStatus('hb1');
+      assert.notEqual(msg2.processing_at, new Date(Date.now() - 5 * 60 * 1000).toISOString());
+    });
+  });
 });

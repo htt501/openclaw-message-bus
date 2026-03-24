@@ -75,9 +75,10 @@ export function createTestDb() {
     RETURNING msg_id, from_agent, type, priority, content, ref, created_at
   `);
 
+  // v1.1.2: 支持 heartbeat — delivered→processing 或 processing→processing(刷新 processing_at)
   const stmtAckProcessing = db.prepare(`
     UPDATE messages SET status = 'processing', processing_at = ?
-    WHERE msg_id = ? AND status = 'delivered'
+    WHERE msg_id = ? AND status IN ('delivered', 'processing')
   `);
 
   const stmtAckCompleted = db.prepare(`
@@ -237,6 +238,16 @@ export function createTestDb() {
 
     getMetrics() { return stmtMetrics.get(); },
     getDbPath() { return ':memory:'; },
+
+    findStaleMessages() {
+      return db.prepare(`
+        SELECT msg_id, from_agent, to_agent, type, priority, content, status, delivered_at, processing_at
+        FROM messages
+        WHERE status IN ('delivered', 'processing')
+          AND type = 'task'
+      `).all();
+    },
+
     getDb() { return db; }
   };
 }

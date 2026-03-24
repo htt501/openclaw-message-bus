@@ -102,7 +102,7 @@ export function createBusSend(db, _runtime, logger, notifyOpts = {}) {
           const replyHint = notifyOpts.replyChannel && notifyOpts.replyTo
             ? ` If you need to reply to the user, use the message tool to send to ${notifyOpts.replyChannel} ${notifyOpts.replyTo}`
             : '';
-          const notifyMsg = `[message-bus] New message ${msgId} from ${from}. You MUST: 1) bus_read to read it 2) process it 3) bus_ack with status=completed 4) bus_send your result back to ${from} with type=response and reply_to=${msgId}. Step 4 is MANDATORY.${replyHint}`;
+          const notifyMsg = `[message-bus] New message ${msgId} from ${from}. You MUST: 1) bus_read to read it 2) process it 3) bus_ack with status=completed 4) bus_send your result back to ${from} with type=response and reply_to=${msgId}. Step 4 is MANDATORY. If you encounter ANY error or cannot complete the task, you MUST: bus_ack with status=failed and reason, then bus_send the error details back to ${from}.${replyHint}`;
           const timeout = (notifyOpts.timeoutSeconds ?? 120);
           exec(
             `openclaw agent --agent ${params.to} --message "${notifyMsg.replace(/"/g, '\\"')}" --timeout ${timeout}`,

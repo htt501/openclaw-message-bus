@@ -123,9 +123,10 @@ export function initDb(stateDir, logger) {
   `);
 
   // v1.1: ack transitions
+  // v1.1.2: 支持 heartbeat — delivered→processing 或 processing→processing(刷新 processing_at)
   const stmtAckProcessing = db.prepare(`
     UPDATE messages SET status = 'processing', processing_at = ?
-    WHERE msg_id = ? AND status = 'delivered'
+    WHERE msg_id = ? AND status IN ('delivered', 'processing')
   `);
 
   const stmtAckCompleted = db.prepare(`
@@ -208,6 +209,14 @@ export function initDb(stateDir, logger) {
 
   const stmtCountThread = db.prepare(`
     SELECT COUNT(*) as count FROM messages WHERE ref = ?
+  `);
+
+  // v1.1.2: find stale delivered/processing messages for timeout notification
+  const stmtFindStale = db.prepare(`
+    SELECT msg_id, from_agent, to_agent, type, priority, content, status, delivered_at, processing_at
+    FROM messages
+    WHERE status IN ('delivered', 'processing')
+      AND type = 'task'
   `);
 
   // --- Operation methods ---
@@ -336,6 +345,15 @@ export function initDb(stateDir, logger) {
 
     getDbPath() {
       return dbPath;
+    },
+
+    /**
+     * v1.1.2: 查找所有 delivered/processing 状态的 task 消息
+     * 由调用方根据优先级阈值过滤
+     * @returns {Array} 所有未完成的 task 消息列表
+     */
+    findStaleMessages() {
+      return stmtFindStale.all();
     },
 
     getDb() {

@@ -6,8 +6,16 @@
 
 import { readFallbackFiles, removeFallbackFile } from './fallback.js';
 import { statSync } from 'node:fs';
+import { generateMsgId } from './id.js';
 
 const TIMEOUT_MINUTES = 10;
+// v1.1.2: 按优先级分级超时阈值（分钟）
+const STALE_THRESHOLDS = {
+  P0: 10,   // 紧急任务 10 分钟
+  P1: 15,   // 高优先级 15 分钟
+  P2: 30,   // 普通任务 30 分钟
+  P3: 60    // 低优先级 1 小时
+};
 
 export function revertTimedOutMessages(db, logger) {
   try {
@@ -70,6 +78,70 @@ export function cleanExpiredMessages(db, logger) {
 
 const STORAGE_WARN_BYTES = 50 * 1024 * 1024;
 
+/**
+ * v1.1.2: 检测超时未完成的 task，按优先级阈值自动通知发送者
+ * P0=10min, P1=15min, P2=30min, P3=60min
+ * agent 可通过 bus_ack(processing) heartbeat 刷新 processing_at 来延长超时
+ */
+const _notifiedStale = new Set(); // 防止重复通知
+
+export function notifyStaleTasks(db, logger) {
+  try {
+    const allTasks = db.findStaleMessages();
+    let notified = 0;
+    const now = Date.now();
+
+    for (const msg of allTasks) {
+      if (_notifiedStale.has(msg.msg_id)) continue;
+
+      // 按优先级取阈值，默认 30 分钟
+      const thresholdMin = STALE_THRESHOLDS[msg.priority] ?? 30;
+      const refTime = msg.processing_at || msg.delivered_at;
+      if (!refTime) continue;
+
+      const ageMin = (now - new Date(refTime).getTime()) / 60000;
+      if (ageMin < thresholdMin) continue;
+
+      try {
+        const msgId = generateMsgId('system');
+        const nowIso = new Date().toISOString();
+        const minutesStale = Math.round(ageMin);
+
+        db.insertMessage({
+          msg_id: msgId,
+          from_agent: 'system',
+          to_agent: msg.from_agent,
+          type: 'notify',
+          priority: 'P1',
+          content: `⚠️ 任务超时通知：你发给 ${msg.to_agent} 的消息 ${msg.msg_id} 已 ${minutesStale} 分钟未完成（当前状态: ${msg.status}，优先级: ${msg.priority}，阈值: ${thresholdMin}min）。${msg.to_agent} 可能卡住或遇到错误。建议：1) bus_status 查询最新状态 2) 考虑重新发送或群聊 @ 对方`,
+          ref: msg.msg_id,
+          reply_to: null,
+          created_at: nowIso
+        });
+
+        _notifiedStale.add(msg.msg_id);
+        notified++;
+      } catch (err) {
+        logger.warn(`cron/stale-notify: failed for ${msg.msg_id}: ${err.message}`);
+      }
+    }
+
+    if (notified > 0) {
+      logger.info(`cron/stale-notify: notified ${notified} senders about stale tasks`);
+    }
+
+    // 清理已完成的消息 ID（防止 Set 无限增长）
+    if (_notifiedStale.size > 1000) {
+      _notifiedStale.clear();
+    }
+
+    return { notified, total: allTasks.length };
+  } catch (err) {
+    logger.error(`cron/stale-notify failed: ${err.message}`);
+    return { notified: 0, total: 0 };
+  }
+}
+
 export function logMetrics(db, runtime, logger) {
   try {
     const metrics = db.getMetrics();
@@ -99,6 +171,7 @@ export function startCronJobs(db, runtime, logger) {
   setInterval(() => {
     revertTimedOutMessages(db, logger);
     recoverFallbackMessages(db, logger);
+    notifyStaleTasks(db, logger);
   }, 5 * 60 * 1000);
 
   setInterval(() => {
