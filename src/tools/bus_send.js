@@ -3,7 +3,7 @@
  * ToolFactory 模式，通过闭包捕获 db, runtime, logger, notifyOpts
  */
 
-import { exec } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { BusSendSchema, getAgents, VALID_TYPES, VALID_PRIORITIES, MAX_CONTENT_BYTES, MAX_THREAD_ROUNDS } from '../schema.js';
 import { generateMsgId } from '../id.js';
 import { formatResult, formatError } from '../format.js';
@@ -17,6 +17,10 @@ import { writeFallback } from '../fallback.js';
  * @param {object} notifyOpts - 通知配置 { enabled, timeoutSeconds, replyChannel, replyTo }
  * @returns {Function} ToolFactory: (ctx) => AnyAgentTool
  */
+// 防抖：同一 agent 在 cooldown 内不重复 push notify
+const _notifyCooldowns = new Map();
+const NOTIFY_COOLDOWN_MS = 30_000; // 30 秒内不重复通知同一 agent
+
 export function createBusSend(db, _runtime, logger, notifyOpts = {}) {
   return (ctx) => ({
     name: 'bus_send',
@@ -96,23 +100,33 @@ export function createBusSend(db, _runtime, logger, notifyOpts = {}) {
         }
       }
 
-      // --- 异步通知目标 agent（fire-and-forget via CLI）---
+      // --- 异步通知目标 agent（fire-and-forget via spawn + detach）---
       if (notifyOpts.enabled !== false) {
-        try {
-          const replyHint = notifyOpts.replyChannel && notifyOpts.replyTo
-            ? ` If you need to reply to the user, use the message tool to send to ${notifyOpts.replyChannel} ${notifyOpts.replyTo}`
-            : '';
-          const notifyMsg = `[message-bus] New message ${msgId} from ${from}. You MUST: 1) bus_read to read it 2) process it 3) bus_ack with status=completed 4) bus_send your result back to ${from} with type=response and reply_to=${msgId}. Step 4 is MANDATORY. If you encounter ANY error or cannot complete the task, you MUST: bus_ack with status=failed and reason, then bus_send the error details back to ${from}.${replyHint}`;
-          const timeout = (notifyOpts.timeoutSeconds ?? 120);
-          exec(
-            `openclaw agent --agent ${params.to} --message "${notifyMsg.replace(/"/g, '\\"')}" --timeout ${timeout}`,
-            { timeout: (timeout + 10) * 1000 },
-            (err) => {
-              if (err) logger.warn(`push notify ${params.to} failed: ${err.message}`);
-            }
-          );
-        } catch (notifyErr) {
-          logger.warn(`push notify skipped for ${msgId}: ${notifyErr.message}`);
+        const now_ms = Date.now();
+        const lastNotify = _notifyCooldowns.get(params.to) ?? 0;
+        if (now_ms - lastNotify < NOTIFY_COOLDOWN_MS) {
+          logger.info(`push notify ${params.to} skipped (cooldown, last ${Math.round((now_ms - lastNotify) / 1000)}s ago)`);
+        } else {
+          _notifyCooldowns.set(params.to, now_ms);
+          try {
+            const replyHint = notifyOpts.replyChannel && notifyOpts.replyTo
+              ? ` If you need to reply to the user, use the message tool to send to ${notifyOpts.replyChannel} ${notifyOpts.replyTo}`
+              : '';
+            const notifyMsg = `[message-bus] New message ${msgId} from ${from}. You MUST: 1) bus_read to read it 2) process it 3) bus_ack with status=completed 4) bus_send your result back to ${from} with type=response and reply_to=${msgId}. Step 4 is MANDATORY. If you encounter ANY error or cannot complete the task, you MUST: bus_ack with status=failed and reason, then bus_send the error details back to ${from}.${replyHint}`;
+            const timeout = (notifyOpts.timeoutSeconds ?? 120);
+            const child = spawn('openclaw', [
+              'agent', '--agent', params.to,
+              '--message', notifyMsg,
+              '--timeout', String(timeout)
+            ], {
+              detached: true,
+              stdio: 'ignore'
+            });
+            child.unref();
+            logger.info(`push notify ${params.to} spawned (pid=${child.pid})`);
+          } catch (notifyErr) {
+            logger.warn(`push notify skipped for ${msgId}: ${notifyErr.message}`);
+          }
         }
       }
 
