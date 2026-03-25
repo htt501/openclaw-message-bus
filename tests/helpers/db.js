@@ -59,12 +59,27 @@ export function createTestDb() {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
   `);
 
-  const stmtRead = db.prepare(`
+  const stmtReadTasks = db.prepare(`
     UPDATE messages
     SET status = 'delivered', delivered_at = ?
     WHERE msg_id IN (
       SELECT msg_id FROM messages
-      WHERE to_agent = ? AND status = 'queued'
+      WHERE to_agent = ? AND status = 'queued' AND type = 'task'
+        AND (? IS NULL OR from_agent = ?)
+      ORDER BY
+        CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 END,
+        created_at ASC
+      LIMIT ?
+    )
+    RETURNING msg_id, from_agent, type, priority, content, ref, created_at
+  `);
+
+  const stmtReadNonTasks = db.prepare(`
+    UPDATE messages
+    SET status = 'completed', delivered_at = ?, completed_at = ?, result = 'auto-ack: read'
+    WHERE msg_id IN (
+      SELECT msg_id FROM messages
+      WHERE to_agent = ? AND status = 'queued' AND type != 'task'
         AND (? IS NULL OR from_agent = ?)
         AND (? IS NULL OR type = ?)
       ORDER BY
@@ -162,13 +177,21 @@ export function createTestDb() {
 
     readMessages(toAgent, from, type, limit) {
       const now = new Date().toISOString();
-      const rows = stmtRead.all(now, toAgent,
-        from ?? null, from ?? null,
-        type ?? null, type ?? null, limit
-      );
+      let rows;
+      if (type === 'task') {
+        rows = stmtReadTasks.all(now, toAgent, from ?? null, from ?? null, limit);
+      } else {
+        const taskRows = stmtReadTasks.all(now, toAgent, from ?? null, from ?? null, limit);
+        const nonTaskRows = stmtReadNonTasks.all(
+          now, now, toAgent,
+          from ?? null, from ?? null,
+          type ?? null, type ?? null, limit
+        );
+        rows = [...taskRows, ...nonTaskRows];
+      }
       const pMap = { P0: 0, P1: 1, P2: 2 };
       rows.sort((a, b) => (pMap[a.priority] ?? 2) - (pMap[b.priority] ?? 2) || a.created_at.localeCompare(b.created_at));
-      return rows;
+      return rows.slice(0, limit);
     },
 
     ackMessage(msgId, opts = {}) {

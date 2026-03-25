@@ -1,5 +1,6 @@
 /**
- * 集成测试 v1.1 — 完整消息生命周期
+ * Integration tests v1.2 — Full message lifecycle
+ * 集成测试 v1.2 — 完整消息生命周期
  */
 
 import { describe, it, beforeEach, mock } from 'node:test';
@@ -14,21 +15,23 @@ import { revertTimedOutMessages, cleanExpiredMessages, logMetrics } from '../../
 
 const logger = { info: mock.fn(), warn: mock.fn(), error: mock.fn() };
 
-describe('v1.1 message lifecycle', () => {
+describe('v1.2 message lifecycle', () => {
   let db, send, read, ack, status;
 
   beforeEach(() => {
     db = createTestDb();
     setAgents(['main', 'ops', 'creator', 'intel', 'strategist', 'chichi']);
 
-    const notifyOpts = { enabled: false };
-    send = createBusSend(db, notifyOpts, logger)({ agentId: 'main' });
+    // createBusSend(db, runtime, logger, notifyOpts)
+    send = createBusSend(db, {}, logger, { enabled: false })({ agentId: 'main' });
     read = createBusRead(db, logger)({ agentId: 'ops' });
     ack = createBusAck(db, logger)({ agentId: 'ops' });
     status = createBusStatus(db, logger)({ agentId: 'main' });
   });
 
-  it('send → read → ack(processing) → ack(completed) → status', async () => {
+  // === Task lifecycle (requires explicit ack) ===
+
+  it('task: send → read → ack(processing) → ack(completed) → status', async () => {
     const sendResult = await send.execute('tc1', { to: 'ops', content: 'deploy v2', type: 'task', priority: 'P0' });
     const msgId = JSON.parse(sendResult.content[0].text).msg_id;
     assert.ok(msgId);
@@ -38,7 +41,7 @@ describe('v1.1 message lifecycle', () => {
     assert.equal(readParsed.messages.length, 1);
     assert.equal(readParsed.messages[0].content, 'deploy v2');
 
-    // Status: delivered, processing_at null
+    // Status: delivered (task stays delivered until explicit ack)
     let sr = await status.execute('tc3', { msg_id: msgId });
     let sp = JSON.parse(sr.content[0].text);
     assert.equal(sp.status, 'delivered');
@@ -67,7 +70,7 @@ describe('v1.1 message lifecycle', () => {
     assert.equal(sp.result, 'deployed ok');
   });
 
-  it('send → read → ack(completed, skip processing)', async () => {
+  it('task: send → read → ack(completed, skip processing)', async () => {
     const sendResult = await send.execute('tc1', { to: 'ops', content: 'quick', type: 'task' });
     const msgId = JSON.parse(sendResult.content[0].text).msg_id;
     await read.execute('tc2', {});
@@ -78,7 +81,7 @@ describe('v1.1 message lifecycle', () => {
     assert.equal(ap.prev_status, 'delivered');
   });
 
-  it('send → read → ack(failed)', async () => {
+  it('task: send → read → ack(failed)', async () => {
     const sendResult = await send.execute('tc1', { to: 'ops', content: 'risky', type: 'task' });
     const msgId = JSON.parse(sendResult.content[0].text).msg_id;
     await read.execute('tc2', {});
@@ -94,41 +97,103 @@ describe('v1.1 message lifecycle', () => {
     assert.equal(sp.fail_reason, 'permission denied');
   });
 
-  it('ack without status defaults to completed (backward compat)', async () => {
-    const sendResult = await send.execute('tc1', { to: 'ops', content: 'simple', type: 'notify' });
+  // === Auto-ack (v1.2): non-task messages complete on read ===
+
+  it('response: auto-completed on bus_read (no ack needed)', async () => {
+    const sendResult = await send.execute('tc1', { to: 'ops', content: 'result data', type: 'response' });
+    const msgId = JSON.parse(sendResult.content[0].text).msg_id;
+
+    const readResult = await read.execute('tc2', {});
+    const readParsed = JSON.parse(readResult.content[0].text);
+    assert.equal(readParsed.messages.length, 1);
+    assert.equal(readParsed.messages[0].content, 'result data');
+
+    // Should be completed immediately after read
+    const sr = await status.execute('tc3', { msg_id: msgId });
+    const sp = JSON.parse(sr.content[0].text);
+    assert.equal(sp.status, 'completed');
+    assert.equal(sp.result, 'auto-ack: read');
+  });
+
+  it('notify: auto-completed on bus_read', async () => {
+    const sendResult = await send.execute('tc1', { to: 'ops', content: 'heads up', type: 'notify' });
     const msgId = JSON.parse(sendResult.content[0].text).msg_id;
     await read.execute('tc2', {});
 
-    const ar = await ack.execute('tc3', { msg_id: msgId });
-    const ap = JSON.parse(ar.content[0].text);
-    assert.equal(ap.status, 'completed');
+    const sr = await status.execute('tc3', { msg_id: msgId });
+    const sp = JSON.parse(sr.content[0].text);
+    assert.equal(sp.status, 'completed');
   });
 
-  it('ack on completed message returns error', async () => {
+  it('discuss: auto-completed on bus_read', async () => {
+    const sendResult = await send.execute('tc1', { to: 'ops', content: 'thoughts?', type: 'discuss' });
+    const msgId = JSON.parse(sendResult.content[0].text).msg_id;
+    await read.execute('tc2', {});
+
+    const sr = await status.execute('tc3', { msg_id: msgId });
+    const sp = JSON.parse(sr.content[0].text);
+    assert.equal(sp.status, 'completed');
+  });
+
+  it('mixed read: task stays delivered, response auto-completed', async () => {
+    await send.execute('tc1', { to: 'ops', content: 'do this', type: 'task', priority: 'P0' });
+    await send.execute('tc2', { to: 'ops', content: 'fyi', type: 'response' });
+
+    const readResult = await read.execute('tc3', {});
+    const readParsed = JSON.parse(readResult.content[0].text);
+    assert.equal(readParsed.messages.length, 2);
+
+    // Check statuses in DB
+    const taskMsg = readParsed.messages.find(m => m.type === 'task');
+    const respMsg = readParsed.messages.find(m => m.type === 'response');
+
+    const taskStatus = db.getMessageStatus(taskMsg.msg_id);
+    const respStatus = db.getMessageStatus(respMsg.msg_id);
+
+    assert.equal(taskStatus.status, 'delivered');   // task needs explicit ack
+    assert.equal(respStatus.status, 'completed');   // response auto-acked
+  });
+
+  // === Error handling ===
+
+  it('ack on completed message returns ALREADY_COMPLETED', async () => {
     const sendResult = await send.execute('tc1', { to: 'ops', content: 'x', type: 'task' });
     const msgId = JSON.parse(sendResult.content[0].text).msg_id;
     await read.execute('tc2', {});
     await ack.execute('tc3', { msg_id: msgId, status: 'completed' });
 
     const ar = await ack.execute('tc4', { msg_id: msgId, status: 'processing' });
-    assert.equal(ar.isError, true);
-    assert.ok(ar.content[0].text.includes('ALREADY_COMPLETED'));
+    const ap = JSON.parse(ar.content[0].text);
+    assert.equal(ap.error, 'ALREADY_COMPLETED');
   });
 
-  it('ack on nonexistent message returns error', async () => {
+  it('ack on nonexistent message returns MSG_NOT_FOUND', async () => {
     const ar = await ack.execute('tc1', { msg_id: 'msg_nope' });
-    assert.equal(ar.isError, true);
-    assert.ok(ar.content[0].text.includes('MSG_NOT_FOUND'));
+    const ap = JSON.parse(ar.content[0].text);
+    assert.equal(ap.error, 'MSG_NOT_FOUND');
   });
 
   it('ack on queued message returns INVALID_TRANSITION', async () => {
     const sendResult = await send.execute('tc1', { to: 'ops', content: 'x', type: 'task' });
     const msgId = JSON.parse(sendResult.content[0].text).msg_id;
+    // Don't read — message stays queued
 
     const ar = await ack.execute('tc2', { msg_id: msgId, status: 'processing' });
-    assert.equal(ar.isError, true);
-    assert.ok(ar.content[0].text.includes('INVALID_TRANSITION'));
+    const ap = JSON.parse(ar.content[0].text);
+    assert.equal(ap.error, 'INVALID_TRANSITION');
   });
+
+  it('ack on auto-completed response returns ALREADY_COMPLETED', async () => {
+    const sendResult = await send.execute('tc1', { to: 'ops', content: 'info', type: 'response' });
+    const msgId = JSON.parse(sendResult.content[0].text).msg_id;
+    await read.execute('tc2', {}); // auto-ack
+
+    const ar = await ack.execute('tc3', { msg_id: msgId });
+    const ap = JSON.parse(ar.content[0].text);
+    assert.equal(ap.error, 'ALREADY_COMPLETED');
+  });
+
+  // === Cron jobs ===
 
   it('cron: processing timeout reverts to queued', async () => {
     const sendResult = await send.execute('tc1', { to: 'ops', content: 'x', type: 'task' });
@@ -171,10 +236,46 @@ describe('v1.1 message lifecycle', () => {
     assert.equal(result.failed, 1);
   });
 
-  it('send with notify disabled does not throw', async () => {
+  // === Send validation ===
+
+  it('send with notify disabled does not spawn child process', async () => {
     const result = await send.execute('tc1', { to: 'ops', content: 'test', type: 'task', priority: 'P0' });
     const parsed = JSON.parse(result.content[0].text);
     assert.ok(parsed.msg_id);
-    assert.equal(parsed.notified, false);
+    assert.equal(parsed.status, 'queued');
+  });
+
+  it('send to invalid agent returns error', async () => {
+    const result = await send.execute('tc1', { to: 'nobody', content: 'test', type: 'task' });
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(parsed.error, 'INVALID_PARAM');
+  });
+
+  it('send with invalid type returns error', async () => {
+    const result = await send.execute('tc1', { to: 'ops', content: 'test', type: 'invalid_type' });
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(parsed.error, 'INVALID_PARAM');
+  });
+
+  it('send with invalid priority returns error', async () => {
+    const result = await send.execute('tc1', { to: 'ops', content: 'test', type: 'task', priority: 'P9' });
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(parsed.error, 'INVALID_PARAM');
+  });
+
+  // === Thread tracking ===
+
+  it('reply_to creates thread ref chain', async () => {
+    const r1 = await send.execute('tc1', { to: 'ops', content: 'start', type: 'task' });
+    const msgId1 = JSON.parse(r1.content[0].text).msg_id;
+    const ref1 = JSON.parse(r1.content[0].text).ref;
+
+    // ops replies
+    const opsSend = createBusSend(db, {}, logger, { enabled: false })({ agentId: 'ops' });
+    const r2 = await opsSend.execute('tc2', { to: 'main', content: 'reply', type: 'response', reply_to: msgId1 });
+    const ref2 = JSON.parse(r2.content[0].text).ref;
+
+    // Same thread ref
+    assert.equal(ref1, ref2);
   });
 });

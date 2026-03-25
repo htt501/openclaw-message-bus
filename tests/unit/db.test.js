@@ -267,20 +267,21 @@ describe('db operations v1.1', () => {
       assert.equal(msg.status, 'expired');
     });
 
-    it('does NOT expire delivered notify messages after 2h', () => {
+    it('does NOT expire auto-completed notify messages (v1.2: auto-ack)', () => {
       db.insertMessage({
         msg_id: 'msg_notify', from_agent: 'a', to_agent: 'b',
         type: 'notify', priority: 'P2', content: 'info',
         created_at: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString()
       });
       db.readMessages('b', null, null, 10);
-      db.getDb().prepare("UPDATE messages SET delivered_at = ? WHERE msg_id = ?")
-        .run(new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(), 'msg_notify');
 
+      // v1.2: notify is auto-completed on read, not delivered
+      const msg = db.getMessageStatus('msg_notify');
+      assert.equal(msg.status, 'completed');
+
+      // cleanExpired should not touch completed messages (only 7-day cleanup)
       const result = db.cleanExpired();
       assert.equal(result.expiredDeliveredTasks, 0);
-      const msg = db.getMessageStatus('msg_notify');
-      assert.equal(msg.status, 'delivered');
     });
   });
 

@@ -1,389 +1,185 @@
-# 推送 openclaw-message-bus 到 OpenClaw 官方的方案
+# Proposal: Message Bus Plugin for OpenClaw
+# 提案：OpenClaw 消息总线插件
 
-> **提议时间**：2026-03-22 22:05  
-> **提议者**：贝吉塔（ops）  
-> **目的**：将消息总线插件贡献给 OpenClaw 开源社区
-
----
-
-## 🎯 目标
-
-**将 `openclaw-message-bus` 插件整合到 OpenClaw 官方项目**
-
-**当前状态**：
-- 仓库：https://github.com/htt501/openclaw-message-bus
-- 状态：独立插件，未 fork 官方仓库
-- 开发者：htt501（tao 哥）
+> **Issue**: https://github.com/openclaw/openclaw/issues/52290  
+> **Repository**: https://github.com/htt501/openclaw-message-bus  
+> **Version**: 1.2.0  
+> **License**: MIT  
+> **Author**: htt501
 
 ---
 
-## 📋 推送方案对比
+## Problem / 问题
 
-### 方案 1：贡献到官方 Extensions（推荐）⭐⭐⭐⭐⭐
+OpenClaw's multi-agent systems lack a reliable async communication channel between agents. The current `sessions_send` approach is synchronous and blocking — when the target agent is busy, the sender blocks until timeout. There is no message persistence, no priority routing, no delivery tracking, and no audit trail.
 
-**路径**：OpenClaw 官方维护一个 Extensions 目录/仓库
+OpenClaw 的多 Agent 系统缺少可靠的异步通信通道。当前的 `sessions_send` 是同步阻塞的 — 目标 agent 忙碌时发送方会阻塞直到超时。没有消息持久化、优先级路由、投递追踪和审计记录。
 
-**实施步骤**：
-1. 在 `openclaw/openclaw` 仓库中创建 PR
-2. 添加到 `extensions/` 或 `plugins/` 目录
-3. 官方审核后合并
+**Real-world issues observed in production (7 agents, 28 cron jobs):**
+- `sessions_send` timeout when target agent is processing another request
+- Messages lost when agent crashes mid-processing
+- No way to track if a message was received, read, or processed
+- Agents sending duplicate messages because they can't verify delivery
+- No priority mechanism — urgent P0 tasks wait behind routine P3 notifications
 
-**优点**：
-- ✅ 成为官方标准插件
-- ✅ 随 OpenClaw 一起分发
-- ✅ 官方文档统一维护
-- ✅ 用户安装最简单
-
-**缺点**：
-- ⚠️ 需要符合官方编码规范
-- ⚠️ 审核周期可能较长
-- ⚠️ 后续修改需要走 PR 流程
-
-**适用场景**：
-- 插件已稳定，可以作为标准功能
-- 愿意交由官方维护
+**生产环境实际问题（7 个 agent，28 个 cron 任务）：**
+- 目标 agent 处理其他请求时 `sessions_send` 超时
+- agent 处理中崩溃导致消息丢失
+- 无法追踪消息是否被接收、读取或处理
+- agent 因无法确认投递而重复发送消息
+- 没有优先级机制 — 紧急 P0 任务排在常规 P3 通知后面
 
 ---
 
-### 方案 2：官方 Awesome List（推荐）⭐⭐⭐⭐
+## Solution / 解决方案
 
-**路径**：OpenClaw 官方维护一个 awesome-openclaw 列表
+`openclaw-message-bus` is an OpenClaw plugin that provides a SQLite-backed async message queue with 4 tools:
 
-**实施步骤**：
-1. 检查是否有 `awesome-openclaw` 仓库
-2. 如果有，提交 PR 添加到列表
-3. 如果没有，建议官方创建
+| Tool | Description |
+|------|-------------|
+| `bus_send` | Send a message to another agent (async, non-blocking) |
+| `bus_read` | Read pending messages (atomic, no duplicate delivery) |
+| `bus_ack` | Acknowledge task completion (processing → completed/failed) |
+| `bus_status` | Query message status and delivery history |
 
-**优点**：
-- ✅ 保持独立维护权
-- ✅ 快速被社区发现
-- ✅ 灵活更新
-- ✅ 不影响官方核心代码
+### Key Design Decisions / 核心设计决策
 
-**缺点**：
-- ⚠️ 用户需要手动安装
-- ⚠️ 不如方案 1 权威
+1. **Auto-ack on read (v1.2)**: Non-task messages (response, notify, discuss) are automatically marked `completed` when read via `bus_read`. Only `task` type requires explicit `bus_ack`. This eliminates the reliability issue of agents forgetting to ack.
 
-**适用场景**：
-- 插件仍在快速迭代
-- 希望保持独立控制权
+   **读取即确认（v1.2）**：非 task 类型消息在 `bus_read` 时自动标记为 `completed`。只有 `task` 类型需要显式 `bus_ack`。从代码层面消除 agent 忘记 ack 的可靠性问题。
 
----
+2. **Fire-and-forget push notify**: Uses `spawn(detached:true) + unref()` to wake target agents via CLI without blocking the sender. Includes 30s per-agent cooldown to prevent notification storms.
 
-### 方案 3：官方插件市场（未来方案）⭐⭐⭐⭐⭐
+   **Fire-and-forget 推送通知**：使用 `spawn(detached:true) + unref()` 通过 CLI 唤醒目标 agent，不阻塞发送方。包含 30 秒防抖防止通知风暴。
 
-**路径**：OpenClaw 官方建立插件市场（类似 VS Code Extensions）
+3. **SQLite + WAL**: Single-file database with Write-Ahead Logging for concurrent read/write. `UPDATE...RETURNING` for atomic message delivery (no duplicate reads).
 
-**实施步骤**：
-1. 等待官方插件市场上线
-2. 提交插件到市场
-3. 用户通过 CLI 或 Web 安装
+   **SQLite + WAL**：单文件数据库，WAL 模式支持并发读写。`UPDATE...RETURNING` 实现原子消息投递（无重复读取）。
 
-**优点**：
-- ✅ 最佳用户体验
-- ✅ 版本管理
-- ✅ 自动更新
-- ✅ 评分 + 评论
+4. **Thread tracking with round limit**: Automatic conversation threading via `ref` field. Configurable round limit (default 10) prevents infinite agent-to-agent loops.
 
-**缺点**：
-- ⚠️ 需要官方开发插件市场
-- ⚠️ 时间周期长
-
-**适用场景**：
-- 长期规划
-- OpenClaw 生态成熟后
+   **话题链追踪 + 轮次限制**：通过 `ref` 字段自动追踪对话线程。可配置轮次上限（默认 10）防止 agent 间无限循环对话。
 
 ---
 
-### 方案 4：独立仓库 + 官方推荐（当前可行）⭐⭐⭐
+## Architecture / 架构
 
-**路径**：保持独立仓库，争取官方推荐
-
-**实施步骤**：
-1. 完善插件文档和示例
-2. 联系 OpenClaw 官方（Discord / GitHub Issue）
-3. 请求在官方 README 中推荐
-4. 或在官方文档中添加插件教程
-
-**优点**：
-- ✅ 保持独立维护权
-- ✅ 获得官方背书
-- ✅ 快速实施
-
-**缺点**：
-- ⚠️ 需要主动联系官方
-- ⚠️ 不如方案 1/2 正式
-
-**适用场景**：
-- 短期快速推广
-- 等待官方更正式的插件机制
-
----
-
-## 🔍 当前插件状态评估
-
-### ✅ 已完成
-
-1. **核心功能**：4 个工具（bus_send/read/ack/status）
-2. **持久化**：SQLite + WAL 模式
-3. **测试**：单元测试 + 集成测试
-4. **文档**：README + ARCHITECTURE + 设计文档
-5. **配置**：openclaw.plugin.json
-6. **安全**：无隐私泄露
-
-### 🔄 待完善
-
-1. **性能测试**：高并发场景
-2. **错误处理**：边界条件
-3. **示例代码**：完整用例
-4. **国际化**：英文文档完整性
-5. **视频教程**：安装 + 使用演示
-
----
-
-## 🎯 推荐执行路径（分阶段）
-
-### 阶段 1：短期（1-2 周）— 方案 4
-
-**目标**：快速获得曝光
-
-**行动**：
-1. ✅ 完善插件文档（英文）
-2. ✅ 添加使用示例
-3. ✅ 联系 OpenClaw 官方
-   - Discord: https://discord.com/invite/clawd
-   - GitHub Issue: 提交插件推荐请求
-4. ✅ 请求在官方 README 中添加链接
-
-**预期结果**：
-- 官方 README 提到 openclaw-message-bus
-- 社区开始使用和反馈
-
----
-
-### 阶段 2：中期（1 个月）— 方案 2
-
-**目标**：进入官方生态
-
-**行动**：
-1. ✅ 根据社区反馈优化插件
-2. ✅ 修复 bug + 性能优化
-3. ✅ 提交到官方 Awesome List（如果有）
-4. ✅ 撰写博客/教程
-
-**预期结果**：
-- 成为社区推荐插件
-- 用户基数增长
-
----
-
-### 阶段 3：长期（3-6 个月）— 方案 1 或 3
-
-**目标**：成为官方标准组件
-
-**行动**：
-1. ✅ 插件稳定版本（v2.0）
-2. ✅ 提交 PR 到官方仓库
-3. ✅ 或等待官方插件市场上线
-
-**预期结果**：
-- 成为 OpenClaw 官方插件
-- 随 OpenClaw 一起安装
-
----
-
-## 📋 具体实施步骤（阶段 1）
-
-### 步骤 1：完善英文文档（2 天）
-
-**任务**：
-- [ ] README.md 完整英文版（已完成 ✅）
-- [ ] ARCHITECTURE.md 英文版（已完成 ✅）
-- [ ] 添加 CONTRIBUTING.md
-- [ ] 添加 CHANGELOG.md
-
----
-
-### 步骤 2：添加使用示例（1 天）
-
-**任务**：
-- [ ] 创建 `examples/` 目录
-- [ ] 添加基本用例（agent-to-agent 通信）
-- [ ] 添加高级用例（优先级 + 线程跟踪）
-- [ ] 添加故障排查示例
-
-**示例结构**：
 ```
-examples/
-├── basic-communication.js      # 基础通信
-├── priority-routing.js         # 优先级路由
-├── thread-tracking.js          # 线程跟踪
-└── error-handling.js           # 错误处理
+┌─────────┐  bus_send   ┌──────────────┐  bus_read   ┌─────────┐
+│ Agent A │ ──────────→ │   SQLite DB  │ ──────────→ │ Agent B │
+│ (sender)│             │  (WAL mode)  │             │ (reader)│
+└─────────┘             └──────────────┘             └─────────┘
+     │                        │                           │
+     │  spawn(detached)       │  cron (5min)              │  bus_ack
+     └──→ openclaw agent      │  - timeout revert         └──→ completed
+          (push notify)       │  - fallback recovery           / failed
+                              │  - stale notification
+                              │  cron (1h)
+                              │  - expiry cleanup
+                              │  - metrics logging
+```
+
+### Message Lifecycle (v1.2)
+
+```
+                    ┌─────────────────────────────────────┐
+                    │           bus_read                    │
+queued ─────────────┤                                      │
+                    │  type=task    → delivered (need ack)  │
+                    │  type=other   → completed (auto-ack)  │
+                    └─────────────────────────────────────┘
+                              │
+                    delivered (task only)
+                         │         │         │
+                    bus_ack    bus_ack    timeout(2h)
+                    processing completed   expired
+                         │
+                    bus_ack
+                    completed / failed
 ```
 
 ---
 
-### 步骤 3：联系 OpenClaw 官方（1 天）
+## Test Coverage / 测试覆盖
 
-**Discord 消息模板**：
 ```
-Hi OpenClaw team! 👋
+57 tests, 57 pass, 0 fail
 
-I've developed a message bus plugin for agent-to-agent async communication:
-https://github.com/htt501/openclaw-message-bus
+Unit tests (38):
+  - db operations: insert, read, ack state transitions, thread counting
+  - auto-ack: non-task messages auto-complete on read
+  - terminal states: ALREADY_COMPLETED, ALREADY_FAILED, MSG_EXPIRED
+  - cron: timeout revert, expiry cleanup, stale detection, heartbeat
+  - format: result/error formatting
+  - id: message ID generation
 
-Features:
-- SQLite-backed message queue
-- Priority routing (P0-P3)
-- Thread tracking
-- Auto-retry & dead-letter handling
-- CLI push notification
-
-Would you be interested in:
-1. Adding it to the official README/docs?
-2. Including it in an official plugin list?
-3. Any feedback on how to better integrate with OpenClaw?
-
-Looking forward to contributing to the OpenClaw ecosystem!
-```
-
-**GitHub Issue 模板**：
-```
-Title: [Plugin] Message Bus for Agent-to-Agent Communication
-
-## Description
-I've developed a message bus plugin for async agent communication in OpenClaw.
-
-## Repository
-https://github.com/htt501/openclaw-message-bus
-
-## Features
-- SQLite-backed message queue
-- Priority routing (P0-P3)
-- Thread tracking
-- Auto-retry & dead-letter handling
-- CLI push notification
-
-## Request
-Would the OpenClaw team be interested in:
-1. Adding this to the official documentation?
-2. Including it in a recommended plugins list?
-3. Feedback on integration improvements?
-
-## Motivation
-Current agent communication using `sessions_send` has limitations:
-- Blocking/synchronous
-- No message persistence
-- No priority routing
-- No audit trail
-
-This plugin aims to solve these issues.
-
-## Additional Context
-- 100% test coverage (unit + integration)
-- Comprehensive documentation
-- MIT licensed
-- Production-ready
-
-Looking forward to feedback and ways to contribute!
+Integration tests (19):
+  - task lifecycle: send → read → ack(processing) → ack(completed)
+  - task lifecycle: send → read → ack(failed)
+  - auto-ack: response/notify/discuss auto-completed on read
+  - mixed read: task stays delivered, response auto-completed
+  - error handling: ALREADY_COMPLETED, MSG_NOT_FOUND, INVALID_TRANSITION
+  - cron: processing timeout, delivered task expiry, metrics
+  - validation: invalid agent, invalid type, invalid priority
+  - thread tracking: reply_to creates ref chain
 ```
 
 ---
 
-### 步骤 4：社交媒体推广（可选）
+## Production Stats / 生产数据
 
-**平台**：
-- Twitter/X
-- Reddit (r/opensource, r/AI)
-- Hacker News
-- Product Hunt（如果 OpenClaw 在上面）
+Running in production since 2026-03-22 with 7 agents:
 
-**推文模板**：
+| Metric | Value |
+|--------|-------|
+| Total messages processed | 550+ |
+| Agents | 7 (main, ops, creator, intel, strategist, chichi, secretary) |
+| Cron jobs using bus | 28 |
+| Average delivery time | < 10 seconds |
+| Message types | task, response, notify, discuss, escalation, request |
+| Database size | < 1MB |
+| Uptime | 72+ hours continuous |
+
+---
+
+## Installation / 安装
+
+```bash
+cd ~/.openclaw/extensions
+git clone https://github.com/htt501/openclaw-message-bus.git
+cd openclaw-message-bus && npm install
 ```
-🚀 Just released openclaw-message-bus - an async message queue plugin for @OpenClawAI
 
-✨ Features:
-- SQLite-backed persistence
-- Priority routing
-- Auto-retry & dead-letter
-- Thread tracking
-
-Perfect for multi-agent systems!
-
-https://github.com/htt501/openclaw-message-bus
-
-#OpenClaw #AI #OpenSource
+Add to `~/.openclaw/openclaw.json`:
+```json
+{
+  "plugins": {
+    "entries": {
+      "openclaw-message-bus": {
+        "enabled": true,
+        "config": {
+          "agents": ["main", "ops", "creator", "intel", "strategist"],
+          "notify": { "enabled": true, "timeoutSeconds": 120 }
+        }
+      }
+    }
+  }
+}
 ```
 
 ---
 
-## 🔥 预期成果
+## What We're Asking For / 我们的请求
 
-### 短期（1-2 周）
-- ✅ 官方社区知道这个插件
-- ✅ 开始有用户试用
-- ✅ 收集反馈
+1. **Review and feedback** on the plugin design and API
+2. **Consideration for official plugin listing** or documentation mention
+3. **Guidance on integration path** — should this be a core feature, official plugin, or community plugin?
 
-### 中期（1 个月）
-- ✅ 修复 bug + 优化性能
-- ✅ 用户基数增长
-- ✅ 成为社区推荐插件
+We're happy to adapt the code to match OpenClaw's coding standards and plugin conventions.
 
-### 长期（3-6 个月）
-- ✅ 成为官方标准插件
-- ✅ 随 OpenClaw 一起分发
-- ✅ 影响 OpenClaw 架构设计
+我们希望：
+1. 对插件设计和 API 的审核反馈
+2. 考虑纳入官方插件列表或文档提及
+3. 集成路径指导 — 应该作为核心功能、官方插件还是社区插件？
 
----
-
-## ⚠️ 注意事项
-
-### 法律/许可
-- ✅ MIT 许可证（与 OpenClaw 兼容）
-- ✅ 无专利或版权问题
-- ✅ 无第三方依赖冲突
-
-### 维护承诺
-- ⚠️ 需要长期维护（bug 修复 + 功能更新）
-- ⚠️ 响应社区 Issue 和 PR
-- ⚠️ 跟随 OpenClaw 版本更新
-
-### 社区规范
-- ✅ 遵守 OpenClaw 社区行为准则
-- ✅ 友好回应反馈
-- ✅ 接受合理的功能请求
-
----
-
-## 🎯 总结
-
-### 推荐方案（分阶段）
-
-1. **立即执行（方案 4）**：
-   - 完善文档 + 联系官方
-   - 争取官方推荐
-
-2. **1 个月后（方案 2）**：
-   - 提交到 Awesome List
-   - 社区推广
-
-3. **3-6 个月后（方案 1 或 3）**：
-   - 成为官方标准插件
-   - 或进入插件市场
-
-### 关键成功因素
-
-- ✅ 插件质量（已达标）
-- ✅ 文档完整（已达标）
-- ✅ 社区反馈（待执行）
-- ✅ 官方支持（待争取）
-
----
-
-**提议者**：贝吉塔（ops）🔥  
-**提议时间**：2026-03-22 22:05  
-**状态**：等待 tao 哥决策
-
----
-
-_"赛亚人的骄傲：开源贡献，造福社区。" 🔥_
+我们愿意根据 OpenClaw 的编码规范和插件约定调整代码。
