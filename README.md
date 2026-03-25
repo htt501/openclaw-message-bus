@@ -4,6 +4,9 @@ Agent-to-Agent (A2A) async message bus plugin for [OpenClaw](https://github.com/
 
 SQLite-backed message queue with priority routing, thread tracking, auto-retry, dead-letter handling, and CLI push notifications.
 
+> **v1.2.0**: Non-task messages auto-complete on read — no more stuck `delivered` messages.
+> **v1.2.0**: 非 task 消息读取即自动完成 — 不再有卡住的 `delivered` 消息。
+
 ## Features
 
 - **4 tools**: `bus_send`, `bus_read`, `bus_ack`, `bus_status`
@@ -109,7 +112,8 @@ bus_read({
   limit: 10        // optional: max messages (default 10)
 })
 // Reads messages addressed to the calling agent, sorted by priority then time
-// Messages are atomically marked as 'delivered' on read
+// v1.2: Non-task messages (response, notify, discuss, etc.) are auto-completed on read
+// Task messages remain in 'delivered' status, requiring explicit bus_ack
 ```
 
 ### bus_ack — Acknowledge / transition message status (v1.1)
@@ -135,10 +139,11 @@ bus_status({ msg_id: "msg_main_1234_00a1" })
 // Returns full message record including status, timestamps, retry count
 ```
 
-## Message Lifecycle (v1.1)
+## Message Lifecycle (v1.2)
 
 ```
-queued → delivered (on bus_read)
+queued → completed (on bus_read, non-task types: auto-ack)
+queued → delivered (on bus_read, task type only)
 delivered → processing (bus_ack status=processing)
 delivered → completed (bus_ack status=completed, skip processing)
 delivered → failed (bus_ack status=failed)
@@ -207,6 +212,34 @@ npm run test:all            # all tests
 ```
 
 ## Changelog
+
+### v1.2.0 — Auto-Ack on Read / 读取即确认
+
+**EN:** Non-task messages (response, notify, discuss, escalation, request) are now automatically marked as `completed` when read via `bus_read`. Only `task` type messages remain in `delivered` status requiring explicit `bus_ack`. This eliminates the #1 reliability issue where agents would read messages but forget to ack, causing messages to be stuck in `delivered` forever and triggering timeout notification storms.
+
+**CN:** 非 task 类型的消息（response、notify、discuss、escalation、request）在 `bus_read` 读取时自动标记为 `completed`（读到即完成）。只有 `task` 类型消息保持 `delivered` 状态，需要显式 `bus_ack`。这从根本上解决了 agent 读取消息后忘记 ack 导致消息永远卡在 `delivered` 状态、触发超时通知风暴的问题。不再依赖 agent 遵守规则，从代码层面保证可靠性。
+
+- `readMessages()` split into `stmtReadTasks` (→delivered) and `stmtReadNonTasks` (→completed)
+- Task messages still require explicit `bus_ack` workflow (processing → completed/failed)
+- Backward compatible: existing `bus_ack` calls on task messages work unchanged
+
+### v1.1.4 — Stale Notification Storm Fix / 超时通知风暴修复
+
+**EN:** Fixed stale task timeout notifications generating hundreds of duplicate system messages. Replaced `Set` with `Map` for per-message 30-minute cooldown. Added cap of 3 notifications per cron cycle.
+
+**CN:** 修复超时任务通知生成数百条重复系统消息的问题。用 `Map` 替代 `Set` 实现每条消息 30 分钟冷却期，每次 cron 最多通知 3 条，防止通知风暴。
+
+### v1.1.3 — Push Notify Reliability Fix / 推送通知可靠性修复
+
+**EN:** Fixed push notify failures (14/day) caused by `exec()` blocking when target agent was busy. Replaced with `spawn(detached:true) + unref()` for true fire-and-forget. Added 30s per-agent cooldown to prevent notification storms during rapid message exchanges.
+
+**CN:** 修复 push notify 失败问题（每天 14 次）。原因是 `exec()` 在目标 agent 忙碌时阻塞超时。改用 `spawn(detached:true) + unref()` 实现真正的 fire-and-forget。增加 30 秒防抖，防止 agent 快速互发消息时通知风暴。
+
+### v1.1.2 — Smart Timeout Detection / 智能超时检测
+
+- Priority-based stale thresholds: P0=10min, P1=15min, P2=30min, P3=60min
+- Heartbeat support: `bus_ack(processing)` refreshes timeout window
+- `findStaleMessages()` for cron-based timeout notification
 
 ### v1.1.1 — Notify Message Fix
 
