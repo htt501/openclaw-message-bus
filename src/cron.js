@@ -83,7 +83,9 @@ const STORAGE_WARN_BYTES = 50 * 1024 * 1024;
  * P0=10min, P1=15min, P2=30min, P3=60min
  * agent 可通过 bus_ack(processing) heartbeat 刷新 processing_at 来延长超时
  */
-const _notifiedStale = new Set(); // 防止重复通知
+const _notifiedStale = new Map(); // msg_id → lastNotifyTimestamp
+const STALE_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000; // 同一条消息至少 30 分钟通知一次
+const MAX_STALE_NOTIFICATIONS_PER_RUN = 3; // 每次 cron 最多通知 3 条
 
 export function notifyStaleTasks(db, logger) {
   try {
@@ -92,7 +94,10 @@ export function notifyStaleTasks(db, logger) {
     const now = Date.now();
 
     for (const msg of allTasks) {
-      if (_notifiedStale.has(msg.msg_id)) continue;
+      if (notified >= MAX_STALE_NOTIFICATIONS_PER_RUN) break;
+
+      const lastNotify = _notifiedStale.get(msg.msg_id) ?? 0;
+      if (now - lastNotify < STALE_NOTIFY_COOLDOWN_MS) continue;
 
       // 按优先级取阈值，默认 30 分钟
       const thresholdMin = STALE_THRESHOLDS[msg.priority] ?? 30;
@@ -119,7 +124,7 @@ export function notifyStaleTasks(db, logger) {
           created_at: nowIso
         });
 
-        _notifiedStale.add(msg.msg_id);
+        _notifiedStale.set(msg.msg_id, now);
         notified++;
       } catch (err) {
         logger.warn(`cron/stale-notify: failed for ${msg.msg_id}: ${err.message}`);
@@ -130,9 +135,12 @@ export function notifyStaleTasks(db, logger) {
       logger.info(`cron/stale-notify: notified ${notified} senders about stale tasks`);
     }
 
-    // 清理已完成的消息 ID（防止 Set 无限增长）
-    if (_notifiedStale.size > 1000) {
-      _notifiedStale.clear();
+    // 清理已过期的消息 ID（防止 Map 无限增长）
+    if (_notifiedStale.size > 500) {
+      const cutoff = now - STALE_NOTIFY_COOLDOWN_MS * 2;
+      for (const [id, ts] of _notifiedStale) {
+        if (ts < cutoff) _notifiedStale.delete(id);
+      }
     }
 
     return { notified, total: allTasks.length };
