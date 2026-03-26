@@ -105,13 +105,13 @@ export function initDb(stateDir, logger) {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
   `);
 
-  // v1.2: bus_read — task 类型 → delivered（需要显式 ack）
-  const stmtReadTasks = db.prepare(`
+  // v1.2.1: bus_read — 需要显式 ack 的类型（task, request, discuss, escalation）
+  const stmtReadActionable = db.prepare(`
     UPDATE messages
     SET status = 'delivered', delivered_at = ?
     WHERE msg_id IN (
       SELECT msg_id FROM messages
-      WHERE to_agent = ? AND status = 'queued' AND type = 'task'
+      WHERE to_agent = ? AND status = 'queued' AND type IN ('task', 'request', 'discuss', 'escalation')
         AND (? IS NULL OR from_agent = ?)
       ORDER BY
         CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 END,
@@ -121,13 +121,13 @@ export function initDb(stateDir, logger) {
     RETURNING msg_id, from_agent, type, priority, content, ref, created_at
   `);
 
-  // v1.2: bus_read — 非 task 类型 → 直接 completed（auto-ack，读到即完成）
+  // v1.2.1: bus_read — 信息类消息自动完成（response, notify）
   const stmtReadNonTasks = db.prepare(`
     UPDATE messages
     SET status = 'completed', delivered_at = ?, completed_at = ?, result = 'auto-ack: read'
     WHERE msg_id IN (
       SELECT msg_id FROM messages
-      WHERE to_agent = ? AND status = 'queued' AND type != 'task'
+      WHERE to_agent = ? AND status = 'queued' AND type IN ('response', 'notify')
         AND (? IS NULL OR from_agent = ?)
         AND (? IS NULL OR type = ?)
       ORDER BY
@@ -193,11 +193,11 @@ export function initDb(stateDir, logger) {
     WHERE status = 'queued' AND created_at < ?
   `);
 
-  // v1.1: expire delivered tasks older than 2h
+  // v1.2.1: expire delivered actionable messages older than 2h
   const stmtExpireDeliveredTasks = db.prepare(`
     UPDATE messages
     SET status = 'expired', expired_at = ?
-    WHERE status = 'delivered' AND type = 'task' AND delivered_at < ?
+    WHERE status = 'delivered' AND type IN ('task', 'request', 'discuss', 'escalation') AND delivered_at < ?
   `);
 
   const stmtExpireDeadLetter = db.prepare(`
@@ -227,12 +227,12 @@ export function initDb(stateDir, logger) {
     SELECT COUNT(*) as count FROM messages WHERE ref = ?
   `);
 
-  // v1.1.2: find stale delivered/processing messages for timeout notification
+  // v1.2.1: find stale delivered/processing messages for timeout notification
   const stmtFindStale = db.prepare(`
     SELECT msg_id, from_agent, to_agent, type, priority, content, status, delivered_at, processing_at
     FROM messages
     WHERE status IN ('delivered', 'processing')
-      AND type = 'task'
+      AND type IN ('task', 'request', 'discuss', 'escalation')
   `);
 
   // --- Operation methods ---
@@ -257,11 +257,11 @@ export function initDb(stateDir, logger) {
 
       let rows;
       if (type === 'task') {
-        // task 类型：只读 task，标记为 delivered（需要显式 ack）
-        rows = stmtReadTasks.all(now, toAgent, from ?? null, from ?? null, limit);
+        // Specific type filter: only actionable
+        rows = stmtReadActionable.all(now, toAgent, from ?? null, from ?? null, limit);
       } else {
-        // 混合读取：task → delivered，非 task → auto-ack completed
-        const taskRows = stmtReadTasks.all(now, toAgent, from ?? null, from ?? null, limit);
+        // Mixed read: actionable → delivered, info → auto-ack completed
+        const actionableRows = stmtReadActionable.all(now, toAgent, from ?? null, from ?? null, limit);
         const nonTaskRows = stmtReadNonTasks.all(
           now, now,
           toAgent,
@@ -269,7 +269,7 @@ export function initDb(stateDir, logger) {
           type ?? null, type ?? null,
           limit
         );
-        rows = [...taskRows, ...nonTaskRows];
+        rows = [...actionableRows, ...nonTaskRows];
       }
 
       const pMap = { P0: 0, P1: 1, P2: 2 };

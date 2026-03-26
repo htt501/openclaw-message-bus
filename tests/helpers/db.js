@@ -59,12 +59,12 @@ export function createTestDb() {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
   `);
 
-  const stmtReadTasks = db.prepare(`
+  const stmtReadActionable = db.prepare(`
     UPDATE messages
     SET status = 'delivered', delivered_at = ?
     WHERE msg_id IN (
       SELECT msg_id FROM messages
-      WHERE to_agent = ? AND status = 'queued' AND type = 'task'
+      WHERE to_agent = ? AND status = 'queued' AND type IN ('task', 'request', 'discuss', 'escalation')
         AND (? IS NULL OR from_agent = ?)
       ORDER BY
         CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 END,
@@ -79,7 +79,7 @@ export function createTestDb() {
     SET status = 'completed', delivered_at = ?, completed_at = ?, result = 'auto-ack: read'
     WHERE msg_id IN (
       SELECT msg_id FROM messages
-      WHERE to_agent = ? AND status = 'queued' AND type != 'task'
+      WHERE to_agent = ? AND status = 'queued' AND type IN ('response', 'notify')
         AND (? IS NULL OR from_agent = ?)
         AND (? IS NULL OR type = ?)
       ORDER BY
@@ -179,15 +179,15 @@ export function createTestDb() {
       const now = new Date().toISOString();
       let rows;
       if (type === 'task') {
-        rows = stmtReadTasks.all(now, toAgent, from ?? null, from ?? null, limit);
+        rows = stmtReadActionable.all(now, toAgent, from ?? null, from ?? null, limit);
       } else {
-        const taskRows = stmtReadTasks.all(now, toAgent, from ?? null, from ?? null, limit);
+        const actionableRows = stmtReadActionable.all(now, toAgent, from ?? null, from ?? null, limit);
         const nonTaskRows = stmtReadNonTasks.all(
           now, now, toAgent,
           from ?? null, from ?? null,
           type ?? null, type ?? null, limit
         );
-        rows = [...taskRows, ...nonTaskRows];
+        rows = [...actionableRows, ...nonTaskRows];
       }
       const pMap = { P0: 0, P1: 1, P2: 2 };
       rows.sort((a, b) => (pMap[a.priority] ?? 2) - (pMap[b.priority] ?? 2) || a.created_at.localeCompare(b.created_at));

@@ -125,33 +125,36 @@ describe('v1.2 message lifecycle', () => {
     assert.equal(sp.status, 'completed');
   });
 
-  it('discuss: auto-completed on bus_read', async () => {
+  it('discuss: stays delivered on bus_read (needs explicit ack)', async () => {
     const sendResult = await send.execute('tc1', { to: 'ops', content: 'thoughts?', type: 'discuss' });
     const msgId = JSON.parse(sendResult.content[0].text).msg_id;
     await read.execute('tc2', {});
 
     const sr = await status.execute('tc3', { msg_id: msgId });
     const sp = JSON.parse(sr.content[0].text);
-    assert.equal(sp.status, 'completed');
+    assert.equal(sp.status, 'delivered');
   });
 
   it('mixed read: task stays delivered, response auto-completed', async () => {
     await send.execute('tc1', { to: 'ops', content: 'do this', type: 'task', priority: 'P0' });
     await send.execute('tc2', { to: 'ops', content: 'fyi', type: 'response' });
+    await send.execute('tc3', { to: 'ops', content: 'approve?', type: 'request' });
 
-    const readResult = await read.execute('tc3', {});
+    const readResult = await read.execute('tc4', {});
     const readParsed = JSON.parse(readResult.content[0].text);
-    assert.equal(readParsed.messages.length, 2);
+    assert.equal(readParsed.messages.length, 3);
 
-    // Check statuses in DB
     const taskMsg = readParsed.messages.find(m => m.type === 'task');
     const respMsg = readParsed.messages.find(m => m.type === 'response');
+    const reqMsg = readParsed.messages.find(m => m.type === 'request');
 
     const taskStatus = db.getMessageStatus(taskMsg.msg_id);
     const respStatus = db.getMessageStatus(respMsg.msg_id);
+    const reqStatus = db.getMessageStatus(reqMsg.msg_id);
 
     assert.equal(taskStatus.status, 'delivered');   // task needs explicit ack
     assert.equal(respStatus.status, 'completed');   // response auto-acked
+    assert.equal(reqStatus.status, 'delivered');     // request needs explicit ack
   });
 
   // === Error handling ===
