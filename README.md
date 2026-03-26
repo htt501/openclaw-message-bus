@@ -178,6 +178,22 @@ Copy this to each agent's SOUL.md and rules directory (e.g. `~/.openclaw/workspa
 6. **Thread limit is 10 rounds** — escalate if you hit ROUND_LIMIT
 ```
 
+## Agent Rules Setup
+
+Run the setup script to install communication rules into all agent workspaces:
+
+```bash
+bash scripts/setup-agent-rules.sh              # default: ~/.openclaw
+bash scripts/setup-agent-rules.sh /path/to/.openclaw  # custom path
+```
+
+This adds three rules to each agent's BOOTSTRAP.md and SOUL.md:
+1. **Whoever discovers it owns it** — any session that reads a bus message must handle it (reply + process)
+2. **No predictions** — report bus results based on actual data, not assumptions
+3. **@all = @me** — group chat @all must be treated as direct mention
+
+Safe to run multiple times (skips agents that already have the rules).
+
 ## Project Structure
 
 ```
@@ -185,6 +201,8 @@ openclaw-message-bus/
 ├── index.js                    # Plugin entry point
 ├── openclaw.plugin.json        # Plugin manifest & config schema
 ├── package.json
+├── scripts/
+│   └── setup-agent-rules.sh    # Install bus rules into agent workspaces
 ├── src/
 │   ├── schema.js               # TypeBox schemas & constants
 │   ├── db.js                   # SQLite layer (better-sqlite3)
@@ -212,6 +230,17 @@ npm run test:all            # all tests
 ```
 
 ## Changelog
+
+### v1.2.1 — Auto-Ack Scope Fix / 自动确认范围修复
+
+**EN:** Fixed v1.2.0 auto-ack being too aggressive — `request`, `discuss`, and `escalation` types were silently auto-completed on read, causing actionable messages (like approval requests) to be dropped. Now only `response` and `notify` auto-complete. Added "whoever discovers it owns it" principle: any session that reads an actionable message must reply immediately and follow through.
+
+**CN:** 修复 v1.2.0 auto-ack 范围过大的问题 — `request`、`discuss`、`escalation` 类型消息在读取时被静默自动完成，导致需要行动的消息（如审批请求）被吞掉。现在只有 `response` 和 `notify` 自动完成。新增"谁发现谁负责"原则：任何 session 读到需要行动的消息必须立即回复并跟进完成。
+
+- Auto-ack types: `response`, `notify` only
+- Explicit ack types: `task`, `request`, `discuss`, `escalation`
+- Added `scripts/setup-agent-rules.sh` for one-click agent rule installation
+- `findStaleMessages` and expiry now cover all actionable types
 
 ### v1.2.0 — Auto-Ack on Read / 读取即确认
 
