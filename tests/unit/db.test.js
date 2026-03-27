@@ -313,6 +313,43 @@ describe('db operations v1.1', () => {
     });
   });
 
+  describe('countThreadRounds', () => {
+    it('counts only actionable types (task, request, discuss, escalation)', () => {
+      const now = new Date().toISOString();
+      db.insertMessage({ msg_id: 'r1', from_agent: 'a', to_agent: 'b', type: 'task', priority: 'P1', content: 'x', ref: 'ref-1', created_at: now });
+      db.insertMessage({ msg_id: 'r2', from_agent: 'b', to_agent: 'a', type: 'request', priority: 'P2', content: 'y', ref: 'ref-1', created_at: now });
+      db.insertMessage({ msg_id: 'r3', from_agent: 'a', to_agent: 'b', type: 'discuss', priority: 'P2', content: 'z', ref: 'ref-1', created_at: now });
+      db.insertMessage({ msg_id: 'r4', from_agent: 'b', to_agent: 'a', type: 'escalation', priority: 'P0', content: 'w', ref: 'ref-1', created_at: now });
+      assert.equal(db.countThreadRounds('ref-1'), 4);
+    });
+
+    it('excludes response and notify types', () => {
+      const now = new Date().toISOString();
+      db.insertMessage({ msg_id: 'r1', from_agent: 'a', to_agent: 'b', type: 'task', priority: 'P1', content: 'x', ref: 'ref-2', created_at: now });
+      db.insertMessage({ msg_id: 'r2', from_agent: 'b', to_agent: 'a', type: 'response', priority: 'P2', content: 'y', ref: 'ref-2', created_at: now });
+      db.insertMessage({ msg_id: 'r3', from_agent: 'a', to_agent: 'b', type: 'notify', priority: 'P2', content: 'z', ref: 'ref-2', created_at: now });
+      assert.equal(db.countThreadRounds('ref-2'), 1);
+      assert.equal(db.countThreadMessages('ref-2'), 3);
+    });
+
+    it('returns 0 for unknown thread ref', () => {
+      assert.equal(db.countThreadRounds('nonexistent-ref'), 0);
+    });
+
+    it('handles mixed actionable and non-actionable types', () => {
+      const now = new Date().toISOString();
+      db.insertMessage({ msg_id: 'm1', from_agent: 'a', to_agent: 'b', type: 'task', priority: 'P1', content: 'a', ref: 'ref-3', created_at: now });
+      db.insertMessage({ msg_id: 'm2', from_agent: 'b', to_agent: 'a', type: 'response', priority: 'P2', content: 'b', ref: 'ref-3', created_at: now });
+      db.insertMessage({ msg_id: 'm3', from_agent: 'a', to_agent: 'b', type: 'request', priority: 'P1', content: 'c', ref: 'ref-3', created_at: now });
+      db.insertMessage({ msg_id: 'm4', from_agent: 'b', to_agent: 'a', type: 'notify', priority: 'P2', content: 'd', ref: 'ref-3', created_at: now });
+      db.insertMessage({ msg_id: 'm5', from_agent: 'a', to_agent: 'b', type: 'escalation', priority: 'P0', content: 'e', ref: 'ref-3', created_at: now });
+      db.insertMessage({ msg_id: 'm6', from_agent: 'b', to_agent: 'a', type: 'discuss', priority: 'P2', content: 'f', ref: 'ref-3', created_at: now });
+      // 4 actionable (task, request, escalation, discuss), 2 non-actionable (response, notify)
+      assert.equal(db.countThreadRounds('ref-3'), 4);
+      assert.equal(db.countThreadMessages('ref-3'), 6);
+    });
+  });
+
   describe('findStaleMessages v1.1.2', () => {
     it('returns delivered/processing task messages', () => {
       const now = new Date().toISOString();

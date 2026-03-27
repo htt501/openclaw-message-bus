@@ -28,7 +28,8 @@ OpenClaw 是一个多 Agent 协作系统，多个 AI Agent 通过飞书群聊协
 │  │  └─────────────────────────────────────┘      │       │
 │  │      │                                         │       │
 │  │      ├─→ CLI Notify (fire & forget)            │       │
-│  │      │   openclaw agent --agent <to> --message │       │
+│  │      │   v3: openclaw agent --session-id <id>  │       │
+│  │      │   Session Resolver → sessions.json      │       │
 │  │      │                                         │       │
 │  │      └─→ Cron Jobs (setInterval)               │       │
 │  │          ├ 5min: revert timeout + recover fb   │       │
@@ -205,8 +206,9 @@ bus_send
 
 ## 11. 测试覆盖
 
-- 34 个单元测试：db operations v1.1、format、id
-- 11 个集成测试：完整生命周期 + cron 任务 + 错误处理
+- 79 个单元测试：db operations、format、id、broadcast、notify、session-resolver
+- 24 个集成测试：完整生命周期 + cron 任务 + 错误处理 + v3 thread counting + broadcast + session-aware notify
+- 7 个 property-based 测试（fast-check）：thread counting、broadcast、session resolver、notify contract
 - 测试使用内存 SQLite (`:memory:`) + mock logger/runtime
 - bus_send 测试中 notify.enabled=false 避免真实 CLI 调用
 - 实际飞书群测试验证：agent 间 task 分发 + bus_send 回复闭环
@@ -238,3 +240,58 @@ bus_send
 | 终态保护 | 无 | ALREADY_COMPLETED/ALREADY_FAILED/MSG_EXPIRED/MSG_DEAD_LETTER |
 | 向后兼容 | — | bus_ack 不传 status 默认 completed |
 | notify 消息 | "read and process" | 明确 4 步指令含强制 bus_send 回复 |
+
+## 14. v3.0 架构变更
+
+### 14.1 Push Notify 架构 — v1.x vs v3
+
+```
+v1.x (Broken):
+  bus_send → spawn: openclaw agent --agent <to> --message ...
+           → 创建孤立 session（无飞书上下文）
+           → 1309+ 垃圾 session
+
+v3 (Session-Aware):
+  bus_send → Session Resolver
+           → 读取 ~/.openclaw/agents/{agentId}/sessions/sessions.json
+           → 找到 session? → spawn: openclaw agent --session-id <id> --message ...
+                           → 注入现有飞书群 session
+           → 没找到?     → 跳过通知，记录警告
+```
+
+### 14.2 Smart Thread Counting
+
+```
+v1.x: ALL messages count → response/notify 浪费轮次 → 线程过早阻塞
+v3:   Only actionable types count (task/request/discuss/escalation)
+      response + notify 不计入轮次 → 确认循环不消耗预算
+```
+
+### 14.3 Broadcast Flow
+
+```
+bus_send({ to: ["ops", "creator", "intel"], ... })
+  → 去重目标列表
+  → 为每个目标插入独立消息（共享 ref）
+  → 为每个目标独立触发 push notify（独立冷却）
+  → 返回 { messages: [...], ref, broadcast: true }
+```
+
+### 14.4 新增模块
+
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| Session Resolver | `src/session-resolver.js` | 读取 agent session store，解析活跃 session |
+| Push Notify | `src/notify.js` | 从 bus_send 提取的独立通知模块，支持 session-aware + cooldown |
+
+### 14.5 v3 变更摘要
+
+| 变更项 | v1.x | v3 |
+|--------|------|-----|
+| Push Notify | `--agent` 创建孤立 session | `--session-id` 注入现有 session |
+| 无 session 时 | 创建垃圾 session | 跳过通知 |
+| Thread Counting | 所有消息计入轮次 | 仅 actionable 类型计入 |
+| bus_send `to` | 仅 string | string 或 string[]（广播） |
+| Notify 模块 | 内嵌 bus_send | 独立 `src/notify.js` |
+| Session Resolver | 无 | `src/session-resolver.js` |
+| Config | enabled, timeout | + sessionAware, preferredSessionKey |

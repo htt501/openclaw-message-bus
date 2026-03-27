@@ -166,6 +166,11 @@ export function createTestDb() {
     SELECT COUNT(*) as count FROM messages WHERE ref = ?
   `);
 
+  const stmtCountThreadRounds = db.prepare(`
+    SELECT COUNT(*) as count FROM messages 
+    WHERE ref = ? AND type IN ('task', 'request', 'discuss', 'escalation')
+  `);
+
   return {
     insertMessage(data) {
       stmtInsert.run(
@@ -227,6 +232,7 @@ export function createTestDb() {
 
     getMessageStatus(msgId) { return stmtGetMessage.get(msgId); },
     countThreadMessages(threadRef) { const row = stmtCountThread.get(threadRef); return row?.count ?? 0; },
+    countThreadRounds(threadRef) { const row = stmtCountThreadRounds.get(threadRef); return row?.count ?? 0; },
 
     revertTimedOut(timeoutMinutes) {
       const cutoff = new Date(Date.now() - timeoutMinutes * 60 * 1000).toISOString();

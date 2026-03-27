@@ -3,24 +3,22 @@
  * ToolFactory 模式，通过闭包捕获 db, runtime, logger, notifyOpts
  */
 
-import { spawn } from 'node:child_process';
 import { BusSendSchema, getAgents, VALID_TYPES, VALID_PRIORITIES, MAX_CONTENT_BYTES, MAX_THREAD_ROUNDS } from '../schema.js';
 import { generateMsgId } from '../id.js';
 import { formatResult, formatError } from '../format.js';
 import { writeFallback } from '../fallback.js';
+import { pushNotify } from '../notify.js';
+
+const ACTIONABLE_TYPES = ['task', 'request', 'discuss', 'escalation'];
 
 /**
  * 创建 bus_send ToolFactory
  * @param {object} db - 数据库操作对象
  * @param {object} _runtime - OpenClaw runtime（保留签名兼容）
  * @param {object} logger - 日志对象
- * @param {object} notifyOpts - 通知配置 { enabled, timeoutSeconds, replyChannel, replyTo }
+ * @param {object} notifyOpts - 通知配置 { enabled, timeoutSeconds, preferredSessionKey, ... }
  * @returns {Function} ToolFactory: (ctx) => AnyAgentTool
  */
-// 防抖：同一 agent 在 cooldown 内不重复 push notify
-const _notifyCooldowns = new Map();
-const NOTIFY_COOLDOWN_MS = 30_000; // 30 秒内不重复通知同一 agent
-
 export function createBusSend(db, _runtime, logger, notifyOpts = {}) {
   return (ctx) => ({
     name: 'bus_send',
@@ -29,11 +27,14 @@ export function createBusSend(db, _runtime, logger, notifyOpts = {}) {
     async execute(toolCallId, params) {
       const from = ctx.agentId;
       const agents = getAgents();
+      const isBroadcast = Array.isArray(params.to);
 
-      // --- 参数验证 ---
-      if (agents.length > 0 && !agents.includes(params.to)) {
-        return formatError('INVALID_PARAM', `Invalid to: ${params.to}. Must be one of: ${agents.join(', ')}`);
+      // --- v3: Broadcast — empty array rejection ---
+      if (isBroadcast && params.to.length === 0) {
+        return formatError('INVALID_PARAM', 'Broadcast target array must not be empty');
       }
+
+      // --- Common param validation (type, priority, content) ---
       const type = params.type ?? 'notify';
       if (!VALID_TYPES.includes(type)) {
         return formatError('INVALID_PARAM', `Invalid type: ${type}. Must be one of: ${VALID_TYPES.join(', ')}`);
@@ -46,10 +47,69 @@ export function createBusSend(db, _runtime, logger, notifyOpts = {}) {
         return formatError('INVALID_PARAM', `Content exceeds ${MAX_CONTENT_BYTES} bytes`);
       }
 
+      // --- v3: Broadcast path ---
+      if (isBroadcast) {
+        // Deduplicate targets
+        const targets = [...new Set(params.to)];
+
+        // Per-target validation against configured agents list
+        if (agents.length > 0) {
+          for (const target of targets) {
+            if (!agents.includes(target)) {
+              return formatError('INVALID_PARAM', `Invalid to: ${target}. Must be one of: ${agents.join(', ')}`);
+            }
+          }
+        }
+
+        // Shared ref for all broadcast messages
+        const sharedRef = params.ref ?? generateMsgId(from);
+        const now = new Date().toISOString();
+        const results = [];
+
+        for (const target of targets) {
+          const msgId = generateMsgId(from);
+          const msgData = {
+            msg_id: msgId,
+            from_agent: from,
+            to_agent: target,
+            type,
+            priority,
+            content: params.content,
+            ref: sharedRef,
+            reply_to: params.reply_to ?? null,
+            created_at: now
+          };
+
+          try {
+            db.insertMessage(msgData);
+            results.push({ msg_id: msgId, to: target, status: 'queued' });
+          } catch (err) {
+            logger.warn(`SQLite write failed for ${msgId} (broadcast to ${target}): ${err.message}`);
+            try {
+              writeFallback(msgId, msgData);
+              results.push({ msg_id: msgId, to: target, status: 'queued_fallback' });
+            } catch (fbErr) {
+              logger.error(`Fallback write also failed for ${msgId}: ${fbErr.message}`);
+              results.push({ msg_id: msgId, to: target, status: 'failed' });
+            }
+          }
+
+          // Fire-and-forget notify per target
+          pushNotify({ targetAgent: target, msgId, fromAgent: from, notifyConfig: notifyOpts, logger });
+        }
+
+        return formatResult({ messages: results, ref: sharedRef, broadcast: true });
+      }
+
+      // --- Single-target path (v1.x backward compatible) ---
+      if (agents.length > 0 && !agents.includes(params.to)) {
+        return formatError('INVALID_PARAM', `Invalid to: ${params.to}. Must be one of: ${agents.join(', ')}`);
+      }
+
       const msgId = generateMsgId(from);
       const now = new Date().toISOString();
 
-      // --- 话题链追踪 & 轮次限制 ---
+      // --- Thread tracking & round limit ---
       let threadRef = params.ref ?? null;
 
       if (params.reply_to) {
@@ -60,8 +120,9 @@ export function createBusSend(db, _runtime, logger, notifyOpts = {}) {
           threadRef = params.reply_to;
         }
 
-        if (threadRef) {
-          const rounds = db.countThreadMessages(threadRef);
+        // v3: Only check round limit for actionable types; skip for response/notify
+        if (threadRef && ACTIONABLE_TYPES.includes(type)) {
+          const rounds = db.countThreadRounds(threadRef);
           if (rounds >= MAX_THREAD_ROUNDS) {
             logger.warn(`thread ${threadRef} reached ${rounds} rounds, blocking`);
             return formatError('ROUND_LIMIT',
@@ -86,7 +147,7 @@ export function createBusSend(db, _runtime, logger, notifyOpts = {}) {
         created_at: now
       };
 
-      // --- SQLite 写入，失败降级 ---
+      // --- SQLite write with fallback ---
       try {
         db.insertMessage(msgData);
       } catch (err) {
@@ -100,37 +161,10 @@ export function createBusSend(db, _runtime, logger, notifyOpts = {}) {
         }
       }
 
-      // --- 异步通知目标 agent（fire-and-forget via spawn + detach）---
-      if (notifyOpts.enabled !== false) {
-        const now_ms = Date.now();
-        const lastNotify = _notifyCooldowns.get(params.to) ?? 0;
-        if (now_ms - lastNotify < NOTIFY_COOLDOWN_MS) {
-          logger.info(`push notify ${params.to} skipped (cooldown, last ${Math.round((now_ms - lastNotify) / 1000)}s ago)`);
-        } else {
-          _notifyCooldowns.set(params.to, now_ms);
-          try {
-            const replyHint = notifyOpts.replyChannel && notifyOpts.replyTo
-              ? ` If you need to reply to the user, use the message tool to send to ${notifyOpts.replyChannel} ${notifyOpts.replyTo}`
-              : '';
-            const notifyMsg = `[message-bus] New message ${msgId} from ${from}. You MUST: 1) bus_read to read it 2) process it 3) bus_ack with status=completed 4) bus_send your result back to ${from} with type=response and reply_to=${msgId}. Step 4 is MANDATORY. If you encounter ANY error or cannot complete the task, you MUST: bus_ack with status=failed and reason, then bus_send the error details back to ${from}.${replyHint}`;
-            const timeout = (notifyOpts.timeoutSeconds ?? 120);
-            const child = spawn('openclaw', [
-              'agent', '--agent', params.to,
-              '--message', notifyMsg,
-              '--timeout', String(timeout)
-            ], {
-              detached: true,
-              stdio: 'ignore'
-            });
-            child.unref();
-            logger.info(`push notify ${params.to} spawned (pid=${child.pid})`);
-          } catch (notifyErr) {
-            logger.warn(`push notify skipped for ${msgId}: ${notifyErr.message}`);
-          }
-        }
-      }
+      // --- Notify target agent ---
+      pushNotify({ targetAgent: params.to, msgId, fromAgent: from, notifyConfig: notifyOpts, logger });
 
-      return formatResult({ msg_id: msgId, status: 'queued', ref: threadRef, round: db.countThreadMessages(threadRef) });
+      return formatResult({ msg_id: msgId, status: 'queued', ref: threadRef, round: db.countThreadRounds(threadRef) });
     }
   });
 }

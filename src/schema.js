@@ -18,10 +18,13 @@ export function getAgents() {
 export const VALID_TYPES = ['task', 'discuss', 'notify', 'request', 'response', 'escalation'];
 export const VALID_PRIORITIES = ['P0', 'P1', 'P2', 'P3'];
 export const MAX_CONTENT_BYTES = 10240;
-export const MAX_THREAD_ROUNDS = 10;
+export const MAX_THREAD_ROUNDS = 4;
 
 export const BusSendSchema = Type.Object({
-  to: Type.String({ description: '目标 Agent ID' }),
+  to: Type.Union([
+    Type.String({ description: 'Target Agent ID' }),
+    Type.Array(Type.String(), { description: 'Broadcast: multiple target Agent IDs' })
+  ]),
   content: Type.String({ description: '消息内容，最大 10KB' }),
   type: Type.Optional(Type.String({ description: '消息类型: task/discuss/notify，默认 notify' })),
   priority: Type.Optional(Type.String({ description: '优先级: P0/P1/P2，默认 P2' })),

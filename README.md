@@ -6,6 +6,8 @@ SQLite-backed message queue with priority routing, thread tracking, auto-retry, 
 
 > **v1.2.0**: Non-task messages auto-complete on read — no more stuck `delivered` messages.
 > **v1.2.0**: 非 task 消息读取即自动完成 — 不再有卡住的 `delivered` 消息。
+> **v3.0.0**: Broadcast support, smart thread counting, session-aware push notify.
+> **v3.0.0**: 广播支持、智能线程计数、会话感知推送通知。
 
 ## Features
 
@@ -46,7 +48,9 @@ Add to `~/.openclaw/openclaw.json` under `plugins.entries`:
             "enabled": true,
             "timeoutSeconds": 120,
             "replyChannel": "feishu",
-            "replyTo": "chat:oc_YOUR_GROUP_CHAT_ID"
+            "replyTo": "chat:oc_YOUR_GROUP_CHAT_ID",
+            "sessionAware": true,
+            "preferredSessionKey": "agent:{agentId}:feishu:group:oc_YOUR_GROUP_CHAT_ID"
           }
         }
       }
@@ -87,6 +91,8 @@ tail -f ~/.openclaw/logs/gateway.err.log
 | `notify.timeoutSeconds` | `number` | `120` | CLI notification timeout |
 | `notify.replyChannel` | `string` | `""` | Channel hint in notification (e.g. `feishu`) |
 | `notify.replyTo` | `string` | `""` | Destination hint (e.g. group chat ID) |
+| `notify.sessionAware` | `boolean` | `true` | v3: Use session resolver for push notify. When true and no session found, notify is skipped (no garbage sessions) |
+| `notify.preferredSessionKey` | `string` | `""` | v3: Preferred session key pattern. Supports `{agentId}` template variable |
 
 ## Tools
 
@@ -101,6 +107,25 @@ bus_send({
   ref: "task-123",              // optional: correlation ID
   reply_to: "msg_main_xxx"     // optional: reply to a specific message
 })
+```
+
+#### v3: Broadcast to multiple agents
+
+```js
+bus_send({
+  to: ["ops", "creator", "intel"],  // array of target agent IDs
+  content: "Sprint planning notes",
+  type: "notify",
+  priority: "P2"
+})
+// Returns: { messages: [{ msg_id, to, status }, ...], ref, broadcast: true }
+// Each target gets their own message with a shared ref for thread grouping
+// Duplicates in the array are automatically deduplicated
+```
+
+#### v3: Smart thread counting
+
+Response and notify messages no longer count toward the thread round limit (default 4). Only actionable types (task, request, discuss, escalation) consume rounds. This prevents confirmation loops from blocking legitimate conversations.
 ```
 
 ### bus_read — Read pending messages
@@ -230,6 +255,21 @@ npm run test:all            # all tests
 ```
 
 ## Changelog
+
+### v3.0.0 — Broadcast, Smart Thread Counting, Session-Aware Notify
+
+**EN:** Major upgrade addressing critical production issues. Push notify now uses session resolver to inject into existing feishu sessions instead of spawning isolated ones (eliminates 1309+ garbage sessions). Thread round counting now only counts actionable types (task, request, discuss, escalation) — response and notify messages no longer consume round budget. Added broadcast support for sending to multiple agents simultaneously. Push notify extracted into dedicated module with per-agent cooldown.
+
+**CN:** 重大升级，解决关键生产问题。推送通知现在使用会话解析器注入现有飞书会话，不再创建孤立会话（消除 1309+ 垃圾会话）。线程轮次计数现在只计算可操作类型（task、request、discuss、escalation）— response 和 notify 消息不再消耗轮次预算。新增广播支持，可同时发送给多个 agent。推送通知提取为独立模块，支持每 agent 冷却。
+
+- `bus_send` `to` parameter accepts string or string array (broadcast)
+- Smart thread counting: only actionable types count toward MAX_THREAD_ROUNDS
+- Session resolver: reads `~/.openclaw/agents/{agentId}/sessions/sessions.json`
+- Push notify uses `--session-id` instead of `--agent` (no garbage sessions)
+- `notify.sessionAware` and `notify.preferredSessionKey` config fields
+- `{agentId}` template variable in preferredSessionKey
+- Per-agent 30s cooldown for push notifications
+- Backward compatible: single-string `to` works identically to v1.x
 
 ### v1.2.1 — Auto-Ack Scope Fix / 自动确认范围修复
 

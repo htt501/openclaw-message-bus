@@ -30,6 +30,7 @@ const plugin = {
 
     const notifyOpts = {
       enabled: config.notify?.enabled !== false,
+      sessionAware: config.notify?.sessionAware !== false, // default true — Phase 2 adds session resolver
       timeoutSeconds: config.notify?.timeoutSeconds ?? 120,
       replyChannel: config.notify?.replyChannel ?? '',
       replyTo: config.notify?.replyTo ?? ''

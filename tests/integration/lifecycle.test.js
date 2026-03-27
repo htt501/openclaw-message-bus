@@ -3,7 +3,7 @@
  * 集成测试 v1.2 — 完整消息生命周期
  */
 
-import { describe, it, beforeEach, mock } from 'node:test';
+import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTestDb } from '../helpers/db.js';
 import { createBusSend } from '../../src/tools/bus_send.js';
@@ -12,6 +12,10 @@ import { createBusAck } from '../../src/tools/bus_ack.js';
 import { createBusStatus } from '../../src/tools/bus_status.js';
 import { setAgents } from '../../src/schema.js';
 import { revertTimedOutMessages, cleanExpiredMessages, logMetrics } from '../../src/cron.js';
+import { pushNotify, _resetCooldowns } from '../../src/notify.js';
+import { getSessionStorePath } from '../../src/session-resolver.js';
+import { writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 
 const logger = { info: mock.fn(), warn: mock.fn(), error: mock.fn() };
 
@@ -280,5 +284,188 @@ describe('v1.2 message lifecycle', () => {
 
     // Same thread ref
     assert.equal(ref1, ref2);
+  });
+});
+
+
+// === v3 Integration Tests ===
+
+describe('v3: smart thread counting lifecycle', () => {
+  let db, send, opsSend, read, ack;
+
+  beforeEach(() => {
+    db = createTestDb();
+    setAgents(['main', 'ops', 'creator', 'intel', 'strategist', 'chichi']);
+    send = createBusSend(db, {}, logger, { enabled: false })({ agentId: 'main' });
+    opsSend = createBusSend(db, {}, logger, { enabled: false })({ agentId: 'ops' });
+    read = createBusRead(db, logger)({ agentId: 'ops' });
+    ack = createBusAck(db, logger)({ agentId: 'ops' });
+  });
+
+  it('task → response → task: response does not increment round count', async () => {
+    // Round 1: main sends task
+    const r1 = await send.execute('tc1', { to: 'ops', content: 'deploy v3', type: 'task' });
+    const p1 = JSON.parse(r1.content[0].text);
+    assert.equal(p1.round, 1);
+    const ref = p1.ref;
+
+    // ops replies with response (should NOT increment round)
+    const r2 = await opsSend.execute('tc2', { to: 'main', content: 'deploying now', type: 'response', reply_to: p1.msg_id });
+    const p2 = JSON.parse(r2.content[0].text);
+    assert.equal(p2.ref, ref);
+    assert.equal(p2.round, 1); // still 1, response doesn't count
+
+    // ops sends notify (should NOT increment round)
+    const r3 = await opsSend.execute('tc3', { to: 'main', content: 'got it', type: 'notify', reply_to: p1.msg_id });
+    const p3 = JSON.parse(r3.content[0].text);
+    assert.equal(p3.round, 1); // still 1
+
+    // Round 2: main sends another task in same thread
+    const r4 = await send.execute('tc4', { to: 'ops', content: 'also update config', type: 'task', reply_to: p1.msg_id });
+    const p4 = JSON.parse(r4.content[0].text);
+    assert.equal(p4.ref, ref);
+    assert.equal(p4.round, 2); // now 2
+
+    // Verify DB count directly
+    assert.equal(db.countThreadRounds(ref), 2);
+    assert.equal(db.countThreadMessages(ref), 4); // total messages is 4
+  });
+});
+
+describe('v3: broadcast lifecycle', () => {
+  let db, send, opsRead, creatorRead, intelRead, opsAck, creatorAck, intelAck;
+
+  beforeEach(() => {
+    db = createTestDb();
+    setAgents(['main', 'ops', 'creator', 'intel', 'strategist', 'chichi']);
+    send = createBusSend(db, {}, logger, { enabled: false })({ agentId: 'main' });
+    opsRead = createBusRead(db, logger)({ agentId: 'ops' });
+    creatorRead = createBusRead(db, logger)({ agentId: 'creator' });
+    intelRead = createBusRead(db, logger)({ agentId: 'intel' });
+    opsAck = createBusAck(db, logger)({ agentId: 'ops' });
+    creatorAck = createBusAck(db, logger)({ agentId: 'creator' });
+    intelAck = createBusAck(db, logger)({ agentId: 'intel' });
+  });
+
+  it('broadcast to 3 agents → each reads → each acks', async () => {
+    // Broadcast
+    const r = await send.execute('tc1', {
+      to: ['ops', 'creator', 'intel'],
+      content: 'sprint planning notes',
+      type: 'task',
+      priority: 'P1'
+    });
+    const parsed = JSON.parse(r.content[0].text);
+    assert.equal(parsed.broadcast, true);
+    assert.equal(parsed.messages.length, 3);
+    const ref = parsed.ref;
+
+    // Each agent reads their message
+    const opsMsg = JSON.parse((await opsRead.execute('tc2', {})).content[0].text);
+    assert.equal(opsMsg.messages.length, 1);
+    assert.equal(opsMsg.messages[0].content, 'sprint planning notes');
+
+    const creatorMsg = JSON.parse((await creatorRead.execute('tc3', {})).content[0].text);
+    assert.equal(creatorMsg.messages.length, 1);
+
+    const intelMsg = JSON.parse((await intelRead.execute('tc4', {})).content[0].text);
+    assert.equal(intelMsg.messages.length, 1);
+
+    // Each agent acks
+    const opsAckR = JSON.parse((await opsAck.execute('tc5', { msg_id: opsMsg.messages[0].msg_id, status: 'completed', result: 'done' })).content[0].text);
+    assert.equal(opsAckR.status, 'completed');
+
+    const creatorAckR = JSON.parse((await creatorAck.execute('tc6', { msg_id: creatorMsg.messages[0].msg_id, status: 'completed', result: 'done' })).content[0].text);
+    assert.equal(creatorAckR.status, 'completed');
+
+    const intelAckR = JSON.parse((await intelAck.execute('tc7', { msg_id: intelMsg.messages[0].msg_id, status: 'completed', result: 'done' })).content[0].text);
+    assert.equal(intelAckR.status, 'completed');
+
+    // All messages share same ref
+    for (const m of parsed.messages) {
+      const s = db.getMessageStatus(m.msg_id);
+      assert.equal(s.ref, ref);
+      assert.equal(s.status, 'completed');
+    }
+  });
+});
+
+describe('v3: session-aware notify integration', () => {
+  let testAgentId, sessionDir;
+
+  beforeEach(() => {
+    _resetCooldowns();
+    testAgentId = `integ-${Date.now()}`;
+    const storePath = getSessionStorePath(testAgentId);
+    sessionDir = join(storePath, '..');
+    mkdirSync(sessionDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    try { rmSync(sessionDir, { recursive: true, force: true }); } catch {}
+  });
+
+  it('session-aware notify resolves session and returns session-aware method', () => {
+    const sessions = {
+      'agent:test:feishu:group:oc_abc': {
+        sessionId: 'sess-integ-123',
+        updatedAt: Date.now()
+      }
+    };
+    writeFileSync(join(sessionDir, 'sessions.json'), JSON.stringify(sessions));
+
+    const result = pushNotify({
+      targetAgent: testAgentId,
+      msgId: 'msg_integ_001',
+      fromAgent: 'main',
+      notifyConfig: { enabled: true, timeoutSeconds: 60 },
+      logger
+    });
+
+    assert.equal(result.notified, true);
+    assert.equal(result.method, 'session-aware');
+    assert.equal(result.sessionId, 'sess-integ-123');
+  });
+
+  it('no session store → skips notify gracefully', () => {
+    const noSessionAgent = `nosess-integ-${Date.now()}`;
+    const result = pushNotify({
+      targetAgent: noSessionAgent,
+      msgId: 'msg_integ_002',
+      fromAgent: 'main',
+      notifyConfig: { enabled: true },
+      logger
+    });
+
+    assert.equal(result.notified, false);
+    assert.equal(result.reason, 'no_session');
+  });
+
+  it('preferredSessionKey with {agentId} template resolves correctly', () => {
+    const sessions = {
+      [`agent:${testAgentId}:feishu:group:oc_xyz`]: {
+        sessionId: 'sess-preferred-456',
+        updatedAt: Date.now()
+      },
+      'other-session': {
+        sessionId: 'sess-other',
+        updatedAt: 1
+      }
+    };
+    writeFileSync(join(sessionDir, 'sessions.json'), JSON.stringify(sessions));
+
+    const result = pushNotify({
+      targetAgent: testAgentId,
+      msgId: 'msg_integ_003',
+      fromAgent: 'main',
+      notifyConfig: {
+        enabled: true,
+        preferredSessionKey: 'agent:{agentId}:feishu:group:oc_xyz'
+      },
+      logger
+    });
+
+    assert.equal(result.notified, true);
+    assert.equal(result.sessionId, 'sess-preferred-456');
   });
 });

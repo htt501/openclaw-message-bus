@@ -227,6 +227,11 @@ export function initDb(stateDir, logger) {
     SELECT COUNT(*) as count FROM messages WHERE ref = ?
   `);
 
+  const stmtCountThreadRounds = db.prepare(`
+    SELECT COUNT(*) as count FROM messages 
+    WHERE ref = ? AND type IN ('task', 'request', 'discuss', 'escalation')
+  `);
+
   // v1.2.1: find stale delivered/processing messages for timeout notification
   const stmtFindStale = db.prepare(`
     SELECT msg_id, from_agent, to_agent, type, priority, content, status, delivered_at, processing_at
@@ -367,6 +372,11 @@ export function initDb(stateDir, logger) {
 
     countThreadMessages(threadRef) {
       const row = stmtCountThread.get(threadRef);
+      return row?.count ?? 0;
+    },
+
+    countThreadRounds(threadRef) {
+      const row = stmtCountThreadRounds.get(threadRef);
       return row?.count ?? 0;
     },
 

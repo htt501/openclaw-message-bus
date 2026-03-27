@@ -1,8 +1,8 @@
 {
   "id": "openclaw-message-bus",
   "name": "A2A Message Bus",
-  "version": "1.0.0",
-  "description": "Agent-to-Agent async message bus with SQLite persistence",
+  "version": "3.0.0",
+  "description": "Agent-to-Agent async message bus with SQLite persistence, broadcast support, and session-aware push notify",
   "entry": "index.js",
   "configSchema": {
     "type": "object",
@@ -19,7 +19,9 @@
           "enabled": { "type": "boolean", "default": true },
           "timeoutSeconds": { "type": "number", "default": 120 },
           "replyChannel": { "type": "string", "default": "" },
-          "replyTo": { "type": "string", "default": "" }
+          "replyTo": { "type": "string", "default": "" },
+          "sessionAware": { "type": "boolean", "default": true, "description": "Use session resolver for push notify (v3). When true and no session found, notify is skipped." },
+          "preferredSessionKey": { "type": "string", "default": "", "description": "Preferred session key pattern. Supports {agentId} template variable." }
         }
       }
     }
