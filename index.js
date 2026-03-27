@@ -41,8 +41,9 @@ const plugin = {
     api.registerTool(createBusAck(db, logger), { name: 'bus_ack' });
     api.registerTool(createBusStatus(db, logger), { name: 'bus_status' });
 
+    // Cron runs in-process via setInterval — no child processes, no extra memory
     startCronJobs(db, runtime, logger);
-    logger.info('message-bus initialized');
+    logger.info('message-bus v3.0.0 initialized');
   }
 };
 
