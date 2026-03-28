@@ -29,11 +29,15 @@ const plugin = {
     }
 
     const notifyOpts = {
-      enabled: config.notify?.enabled !== false,
-      sessionAware: config.notify?.sessionAware !== false, // default true — Phase 2 adds session resolver
+      // v3.0.1: Plugin-level push notify disabled by default.
+      // CLI --session-id does NOT deliver to Feishu (verified 2026-03-28).
+      // Push notify is now handled at Agent layer via sessions_send.
+      enabled: config.notify?.enabled === true, // default false (was !== false)
+      sessionAware: config.notify?.sessionAware !== false,
       timeoutSeconds: config.notify?.timeoutSeconds ?? 120,
       replyChannel: config.notify?.replyChannel ?? '',
-      replyTo: config.notify?.replyTo ?? ''
+      replyTo: config.notify?.replyTo ?? '',
+      preferredSessionKey: config.notify?.preferredSessionKey ?? ''
     };
 
     api.registerTool(createBusSend(db, runtime, logger, notifyOpts), { name: 'bus_send' });
