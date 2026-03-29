@@ -66,6 +66,21 @@ BOOTSTRAP_RULE='
 
 ---
 
+## 📢 广播必须唤醒 / Broadcast Must Wake All Targets
+
+**bus_send 广播（to 为数组）后，无论什么 type，必须对每个目标调 sessions_send 唤醒。**
+广播 = 群发，所有人必须立即知道。
+
+```
+bus_send({ to: ["ops", "creator", "intel"], content: "xxx", type: "notify" })
+// 必须逐个唤醒：
+sessions_send({ sessionKey: "agent:ops:feishu:group:oc_xxx", message: "📬 你有新 bus 广播消息，请 bus_read() 处理", timeoutSeconds: 15 })
+sessions_send({ sessionKey: "agent:creator:feishu:group:oc_xxx", message: "📬 你有新 bus 广播消息，请 bus_read() 处理", timeoutSeconds: 15 })
+sessions_send({ sessionKey: "agent:intel:feishu:group:oc_xxx", message: "📬 你有新 bus 广播消息，请 bus_read() 处理", timeoutSeconds: 15 })
+```
+
+---
+
 ## 🚫 禁止预测 Bus 通信结果 / No Predictions on Bus Results
 
 - **Only report facts**: bus communication results must be based on actual bus_read data

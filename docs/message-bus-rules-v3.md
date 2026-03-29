@@ -76,11 +76,21 @@ sessions_send({
 })
 ```
 
-**不唤醒**（type = response / notify）：
+**不唤醒**（type = response / notify，单播场景）：
 ```
 bus_send({ to: "main", content: "做完了", type: "response", reply_to: "msg_xxx" })
 // 不调 sessions_send，对方下次激活时 bus_read 获取
 // 防止乒乓风暴
+```
+
+**⚠️ 广播例外：广播消息无论什么 type 都必须唤醒所有目标**
+```
+// 广播 = 群发，所有人都需要立即知道
+bus_send({ to: ["ops", "creator", "intel"], content: "xxx", type: "notify" })
+// 即使是 notify/response，广播场景也必须逐个 sessions_send 唤醒：
+sessions_send({ sessionKey: "agent:ops:feishu:group:oc_7b975ce73644030ddb8a284335af7002", message: "📬 你有新 bus 广播消息，请 bus_read() 处理", timeoutSeconds: 15 })
+sessions_send({ sessionKey: "agent:creator:feishu:group:oc_7b975ce73644030ddb8a284335af7002", message: "📬 你有新 bus 广播消息，请 bus_read() 处理", timeoutSeconds: 15 })
+sessions_send({ sessionKey: "agent:intel:feishu:group:oc_7b975ce73644030ddb8a284335af7002", message: "📬 你有新 bus 广播消息，请 bus_read() 处理", timeoutSeconds: 15 })
 ```
 
 ### sessionKey 映射表
@@ -108,7 +118,7 @@ bus_send({
 // 每个目标独立消息，共享 ref
 ```
 
-广播后对每个 task/request/discuss 目标调 sessions_send 唤醒。
+广播后**必须**对每个目标调 sessions_send 唤醒（无论什么 type）。
 
 ### 智能线程计数
 - 只有 task/request/discuss/escalation 计入轮次（MAX_THREAD_ROUNDS=4）
@@ -135,7 +145,8 @@ bus_send({
 
 1. **每次激活先 bus_read** — 检查是否有待处理消息
 2. **bus_send(task/request/discuss) 后必须 sessions_send 唤醒目标** — 这是 v3 的核心规则
-3. **bus_send(response/notify) 后不唤醒** — 防止乒乓风暴
+3. **单播 bus_send(response/notify) 后不唤醒** — 防止乒乓风暴
+4. **⚠️ 广播消息无论什么 type 都必须 sessions_send 唤醒所有目标** — 广播 = 群发，所有人必须立即知道
 4. **处理完 task 消息后 bus_ack(completed)** — 确认已处理
 5. **紧急事项用 P0/P1** — 普通通知用 P2
 6. **回复消息用 reply_to** — 自动继承话题 ref 并计算轮次
