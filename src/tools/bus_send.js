@@ -7,7 +7,7 @@ import { BusSendSchema, getAgents, VALID_TYPES, VALID_PRIORITIES, MAX_CONTENT_BY
 import { generateMsgId } from '../id.js';
 import { formatResult, formatError } from '../format.js';
 import { writeFallback } from '../fallback.js';
-import { pushNotify } from '../notify.js';
+import { pushNotify, broadcastNotify } from '../notify.js';
 
 const ACTIONABLE_TYPES = ['task', 'request', 'discuss', 'escalation'];
 
@@ -94,8 +94,8 @@ export function createBusSend(db, _runtime, logger, notifyOpts = {}) {
             }
           }
 
-          // Fire-and-forget notify per target
-          pushNotify({ targetAgent: target, msgId, fromAgent: from, notifyConfig: notifyOpts, logger });
+          // Fire-and-forget notify per target — broadcast always wakes (v3.0.2)
+          broadcastNotify({ targetAgent: target, msgId, fromAgent: from, notifyConfig: notifyOpts, logger });
         }
 
         return formatResult({ messages: results, ref: sharedRef, broadcast: true });
