@@ -21,24 +21,26 @@ const plugin = {
     const stateDir = runtime.state.resolveStateDir();
     const db = initDb(stateDir, logger);
     const config = api.config ?? {};
+    // api.config may be the full openclaw.json or just the plugin's config section
+    // Detect and extract the plugin-specific config if needed
+    const pluginConfig = config.plugins?.entries?.['openclaw-message-bus']?.config ?? config;
 
     // Merge configured agents into VALID_AGENTS
-    if (Array.isArray(config.agents) && config.agents.length > 0) {
-      setAgents(config.agents);
-      logger.info(`agents configured: ${config.agents.join(', ')}`);
+    if (Array.isArray(pluginConfig.agents) && pluginConfig.agents.length > 0) {
+      setAgents(pluginConfig.agents);
+      logger.info(`agents configured: ${pluginConfig.agents.join(', ')}`);
     }
 
     const notifyOpts = {
-      // v3.0.1: Plugin-level push notify disabled by default.
-      // CLI --session-id does NOT deliver to Feishu (verified 2026-03-28).
-      // Push notify is now handled at Agent layer via sessions_send.
-      enabled: config.notify?.enabled === true, // default false (was !== false)
-      sessionAware: config.notify?.sessionAware !== false,
-      timeoutSeconds: config.notify?.timeoutSeconds ?? 120,
-      replyChannel: config.notify?.replyChannel ?? '',
-      replyTo: config.notify?.replyTo ?? '',
-      preferredSessionKey: config.notify?.preferredSessionKey ?? ''
+      enabled: pluginConfig.notify?.enabled === true,
+      sessionAware: pluginConfig.notify?.sessionAware !== false,
+      timeoutSeconds: pluginConfig.notify?.timeoutSeconds ?? 120,
+      replyChannel: pluginConfig.notify?.replyChannel ?? '',
+      replyTo: pluginConfig.notify?.replyTo ?? '',
+      preferredSessionKey: pluginConfig.notify?.preferredSessionKey ?? ''
     };
+
+    logger.info(`notify config: enabled=${notifyOpts.enabled}, replyTo=${notifyOpts.replyTo}, replyChannel=${notifyOpts.replyChannel}`);
 
     api.registerTool(createBusSend(db, runtime, logger, notifyOpts), { name: 'bus_send' });
     api.registerTool(createBusRead(db, logger), { name: 'bus_read' });
