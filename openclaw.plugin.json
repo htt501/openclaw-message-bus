@@ -1,8 +1,8 @@
 {
   "id": "openclaw-message-bus",
   "name": "A2A Message Bus",
-  "version": "3.0.0",
-  "description": "Agent-to-Agent async message bus with SQLite persistence, broadcast support, and session-aware push notify",
+  "version": "3.1.0",
+  "description": "Agent-to-Agent async message bus with SQLite persistence, broadcast support, and auto-deliver push notify",
   "entry": "index.js",
   "configSchema": {
     "type": "object",
