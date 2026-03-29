@@ -161,8 +161,12 @@ export function createBusSend(db, _runtime, logger, notifyOpts = {}) {
         }
       }
 
-      // --- Notify target agent ---
-      pushNotify({ targetAgent: params.to, msgId, fromAgent: from, notifyConfig: notifyOpts, logger });
+      // --- Notify target agent (v3.0.2: always deliver for actionable types) ---
+      if (ACTIONABLE_TYPES.includes(type)) {
+        broadcastNotify({ targetAgent: params.to, msgId, fromAgent: from, notifyConfig: notifyOpts, logger });
+      } else {
+        pushNotify({ targetAgent: params.to, msgId, fromAgent: from, notifyConfig: notifyOpts, logger });
+      }
 
       return formatResult({ msg_id: msgId, status: 'queued', ref: threadRef, round: db.countThreadRounds(threadRef) });
     }
