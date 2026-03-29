@@ -75,17 +75,20 @@ export function pushNotify({ targetAgent, msgId, fromAgent, notifyConfig, logger
  * v3.0.2: Broadcast notify — always wake target agent via CLI --deliver to feishu.
  * Bypasses the enabled/disabled flag — broadcast = must wake.
  * Uses --agent + --deliver + --reply-channel feishu + --reply-to to deliver to group chat.
+ * v3.0.4: Includes original message content so agent can act immediately.
  * Never throws.
  *
  * @param {object} opts
  * @param {string} opts.targetAgent - Agent to notify
  * @param {string} opts.msgId - Message ID triggering notification
  * @param {string} opts.fromAgent - Sender agent ID
+ * @param {string} [opts.content] - Original message content
+ * @param {string} [opts.type] - Message type (task/request/notify/etc)
  * @param {object} opts.notifyConfig - { replyTo, replyChannel, timeoutSeconds, ... }
  * @param {object} opts.logger - Logger instance
  * @returns {{ notified: boolean, method: string, reason?: string }}
  */
-export function broadcastNotify({ targetAgent, msgId, fromAgent, notifyConfig, logger }) {
+export function broadcastNotify({ targetAgent, msgId, fromAgent, content, type, notifyConfig, logger }) {
   try {
     // Cooldown check (separate namespace: broadcast:<agent>)
     const cooldownKey = `broadcast:${targetAgent}`;
@@ -105,7 +108,19 @@ export function broadcastNotify({ targetAgent, msgId, fromAgent, notifyConfig, l
       return { notified: false, method: 'skipped', reason: 'no_replyTo' };
     }
 
-    const notifyMsg = `📬 你有新的 bus 广播消息 ${msgId} 来自 ${fromAgent}。请立即执行 bus_read() 查收并处理。`;
+    // Build message with original content so agent can act immediately
+    const truncContent = content && content.length > 500 ? content.slice(0, 500) + '...' : (content ?? '');
+    const notifyMsg = [
+      `📬 Bus 消息 [${msgId}] 来自 ${fromAgent} (type: ${type ?? 'unknown'})`,
+      '',
+      truncContent,
+      '',
+      '⚡ 请立即执行：',
+      '1. bus_read() 读取完整消息',
+      '2. 按消息内容执行',
+      '3. bus_ack({ msg_id: "' + msgId + '", status: "completed" })',
+      '4. 在群里回复执行结果'
+    ].join('\n');
 
     const args = [
       'agent',

@@ -95,7 +95,7 @@ export function createBusSend(db, _runtime, logger, notifyOpts = {}) {
           }
 
           // Fire-and-forget notify per target — broadcast always wakes (v3.0.2)
-          broadcastNotify({ targetAgent: target, msgId, fromAgent: from, notifyConfig: notifyOpts, logger });
+          broadcastNotify({ targetAgent: target, msgId, fromAgent: from, content: params.content, type, notifyConfig: notifyOpts, logger });
         }
 
         return formatResult({ messages: results, ref: sharedRef, broadcast: true });
@@ -162,7 +162,7 @@ export function createBusSend(db, _runtime, logger, notifyOpts = {}) {
       }
 
       // --- Notify target agent (v3.0.3: always deliver to wake target) ---
-      broadcastNotify({ targetAgent: params.to, msgId, fromAgent: from, notifyConfig: notifyOpts, logger });
+      broadcastNotify({ targetAgent: params.to, msgId, fromAgent: from, content: params.content, type, notifyConfig: notifyOpts, logger });
 
       return formatResult({ msg_id: msgId, status: 'queued', ref: threadRef, round: db.countThreadRounds(threadRef) });
     }
