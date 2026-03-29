@@ -115,11 +115,11 @@ export function broadcastNotify({ targetAgent, msgId, fromAgent, content, type, 
       '',
       truncContent,
       '',
-      '⚡ 请立即执行：',
-      '1. bus_read() 读取完整消息',
-      '2. 按消息内容执行',
+      '⚡ 你必须立即执行以下步骤（全部必做，不可跳过）：',
+      '1. bus_read() 读取所有未读消息',
+      '2. 按消息内容执行要求的操作',
       '3. bus_ack({ msg_id: "' + msgId + '", status: "completed" })',
-      '4. 在群里回复执行结果'
+      '4. 用 message 工具在飞书群里回复执行结果（这一步是强制的，必须发到群里，禁止 NO_REPLY）'
     ].join('\n');
 
     const args = [
