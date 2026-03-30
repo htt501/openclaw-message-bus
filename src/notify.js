@@ -63,6 +63,12 @@ export function pushNotify({ targetAgent, msgId, fromAgent, notifyConfig, logger
     ], { detached: true, stdio: 'ignore' });
     child.unref();
 
+    // Kill child after timeout to prevent orphan process accumulation
+    const killTimeout = (timeout + 30) * 1000;
+    setTimeout(() => {
+      try { process.kill(child.pid, 0); process.kill(child.pid, 'SIGTERM'); } catch {}
+    }, killTimeout).unref();
+
     logger.info(`push notify ${targetAgent} via session ${session.sessionId} (pid=${child.pid})`);
     return { notified: true, method: 'session-aware', sessionId: session.sessionId };
   } catch (err) {
@@ -134,6 +140,12 @@ export function broadcastNotify({ targetAgent, msgId, fromAgent, content, type, 
 
     const child = spawn('openclaw', args, { detached: true, stdio: 'ignore' });
     child.unref();
+
+    // Kill child after timeout to prevent orphan process accumulation
+    const killTimeout = (timeout + 30) * 1000; // timeout + 30s buffer
+    setTimeout(() => {
+      try { process.kill(child.pid, 0); process.kill(child.pid, 'SIGTERM'); } catch {}
+    }, killTimeout).unref();
 
     logger.info(`broadcast notify ${targetAgent} via --deliver ${replyChannel}:${replyTo} (pid=${child.pid})`);
     return { notified: true, method: 'broadcast-deliver' };
