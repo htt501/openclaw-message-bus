@@ -7,6 +7,7 @@
 import { readFallbackFiles, removeFallbackFile } from './fallback.js';
 import { statSync } from 'node:fs';
 import { generateMsgId } from './id.js';
+import { broadcastNotify } from './notify.js';
 
 const TIMEOUT_MINUTES = 10;
 // v1.1.2: 按优先级分级超时阈值（分钟）
@@ -87,7 +88,7 @@ const _notifiedStale = new Map(); // msg_id → lastNotifyTimestamp
 const STALE_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000; // 同一条消息至少 30 分钟通知一次
 const MAX_STALE_NOTIFICATIONS_PER_RUN = 3; // 每次 cron 最多通知 3 条
 
-export function notifyStaleTasks(db, logger) {
+export function notifyStaleTasks(db, logger, notifyConfig = {}) {
   try {
     const allTasks = db.findStaleMessages();
     let notified = 0;
@@ -122,6 +123,17 @@ export function notifyStaleTasks(db, logger) {
           ref: msg.msg_id,
           reply_to: null,
           created_at: nowIso
+        });
+
+        // Wake target agent so they actually read the notification
+        broadcastNotify({
+          targetAgent: msg.from_agent,
+          msgId,
+          fromAgent: 'system',
+          content: `⚠️ 任务超时：你发给 ${msg.to_agent} 的消息已 ${minutesStale} 分钟未完成`,
+          type: 'notify',
+          notifyConfig,
+          logger
         });
 
         _notifiedStale.set(msg.msg_id, now);
@@ -175,11 +187,11 @@ export function logMetrics(db, runtime, logger) {
   }
 }
 
-export function startCronJobs(db, runtime, logger) {
+export function startCronJobs(db, runtime, logger, notifyConfig = {}) {
   setInterval(() => {
     revertTimedOutMessages(db, logger);
     recoverFallbackMessages(db, logger);
-    notifyStaleTasks(db, logger);
+    notifyStaleTasks(db, logger, notifyConfig);
   }, 5 * 60 * 1000);
 
   setInterval(() => {
