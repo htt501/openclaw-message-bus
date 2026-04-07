@@ -96,8 +96,8 @@ export function pushNotify({ targetAgent, msgId, fromAgent, notifyConfig, logger
  */
 export function broadcastNotify({ targetAgent, msgId, fromAgent, content, type, notifyConfig, logger }) {
   try {
-    // Cooldown check (separate namespace: broadcast:<agent>)
-    const cooldownKey = `broadcast:${targetAgent}`;
+    // Cooldown check (per-agent + per-message to avoid swallowing different notifications)
+    const cooldownKey = `broadcast:${targetAgent}:${msgId}`;
     const now = Date.now();
     const last = _cooldowns.get(cooldownKey) ?? 0;
     if (now - last < COOLDOWN_MS) {

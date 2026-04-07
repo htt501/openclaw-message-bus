@@ -84,9 +84,10 @@ const STORAGE_WARN_BYTES = 50 * 1024 * 1024;
  * P0=10min, P1=15min, P2=30min, P3=60min
  * agent 可通过 bus_ack(processing) heartbeat 刷新 processing_at 来延长超时
  */
-const _notifiedStale = new Map(); // msg_id → lastNotifyTimestamp
-const STALE_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000; // 同一条消息至少 30 分钟通知一次
-const MAX_STALE_NOTIFICATIONS_PER_RUN = 3; // 每次 cron 最多通知 3 条
+const _notifiedStale = new Map(); // msg_id → { lastNotifyTs, count }
+const STALE_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000;
+const MAX_STALE_NOTIFICATIONS_PER_RUN = 3;
+const MAX_NOTIFY_PER_MESSAGE = 3; // Bug #1: max 3 notifications per stale message ever
 
 export function notifyStaleTasks(db, logger, notifyConfig = {}) {
   try {
@@ -97,16 +98,32 @@ export function notifyStaleTasks(db, logger, notifyConfig = {}) {
     for (const msg of allTasks) {
       if (notified >= MAX_STALE_NOTIFICATIONS_PER_RUN) break;
 
-      const lastNotify = _notifiedStale.get(msg.msg_id) ?? 0;
-      if (now - lastNotify < STALE_NOTIFY_COOLDOWN_MS) continue;
+      const entry = _notifiedStale.get(msg.msg_id) ?? { ts: 0, count: 0 };
 
-      // 按优先级取阈值，默认 30 分钟
+      // Bug #1: stop after MAX_NOTIFY_PER_MESSAGE total notifications
+      if (entry.count >= MAX_NOTIFY_PER_MESSAGE) continue;
+
+      // Bug #3: cooldown check (memory-based, resets on gateway restart)
+      if (now - entry.ts < STALE_NOTIFY_COOLDOWN_MS) continue;
+
       const thresholdMin = STALE_THRESHOLDS[msg.priority] ?? 30;
       const refTime = msg.processing_at || msg.delivered_at;
       if (!refTime) continue;
 
       const ageMin = (now - new Date(refTime).getTime()) / 60000;
       if (ageMin < thresholdMin) continue;
+
+      // Bug #4: re-check message status before notifying (race condition guard)
+      const freshMsg = db.getMessageStatus(msg.msg_id);
+      if (!freshMsg || freshMsg.status === 'completed' || freshMsg.status === 'failed' || freshMsg.status === 'expired') continue;
+
+      // Bug #5: check if there's already a queued system notify for this ref
+      try {
+        const existing = db.getDb().prepare(
+          "SELECT COUNT(*) as c FROM messages WHERE from_agent = 'system' AND ref = ? AND status = 'queued'"
+        ).get(msg.msg_id);
+        if (existing && existing.c > 0) continue; // skip, already has pending notify
+      } catch { /* ignore, proceed with notification */ }
 
       try {
         const msgId = generateMsgId('system');
@@ -119,13 +136,12 @@ export function notifyStaleTasks(db, logger, notifyConfig = {}) {
           to_agent: msg.from_agent,
           type: 'notify',
           priority: 'P1',
-          content: `⚠️ 任务超时通知：你发给 ${msg.to_agent} 的消息 ${msg.msg_id} 已 ${minutesStale} 分钟未完成（当前状态: ${msg.status}，优先级: ${msg.priority}，阈值: ${thresholdMin}min）。${msg.to_agent} 可能卡住或遇到错误。建议：1) bus_status 查询最新状态 2) 考虑重新发送或群聊 @ 对方`,
+          content: `⚠️ 任务超时通知 (${entry.count + 1}/${MAX_NOTIFY_PER_MESSAGE})：你发给 ${msg.to_agent} 的消息 ${msg.msg_id} 已 ${minutesStale} 分钟未完成（状态: ${freshMsg.status}，优先级: ${msg.priority}）。建议：bus_status 查询或群聊 @ 对方`,
           ref: msg.msg_id,
           reply_to: null,
           created_at: nowIso
         });
 
-        // Wake target agent so they actually read the notification
         broadcastNotify({
           targetAgent: msg.from_agent,
           msgId,
@@ -136,7 +152,7 @@ export function notifyStaleTasks(db, logger, notifyConfig = {}) {
           logger
         });
 
-        _notifiedStale.set(msg.msg_id, now);
+        _notifiedStale.set(msg.msg_id, { ts: now, count: entry.count + 1 });
         notified++;
       } catch (err) {
         logger.warn(`cron/stale-notify: failed for ${msg.msg_id}: ${err.message}`);

@@ -120,6 +120,14 @@ export function createBusSend(db, _runtime, logger, notifyOpts = {}) {
           threadRef = params.reply_to;
         }
 
+        // Bug #2: implicit ack — if replying to a delivered task, auto-mark as processing
+        if (origMsg && origMsg.status === 'delivered' && ACTIONABLE_TYPES.includes(origMsg.type)) {
+          try {
+            db.ackMessage(params.reply_to, { status: 'processing' });
+            logger.info(`implicit ack: ${params.reply_to} → processing (reply from ${from})`);
+          } catch { /* ignore ack errors */ }
+        }
+
         // v3: Only check round limit for actionable types; skip for response/notify
         if (threadRef && ACTIONABLE_TYPES.includes(type)) {
           const rounds = db.countThreadRounds(threadRef);

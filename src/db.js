@@ -187,6 +187,12 @@ export function initDb(stateDir, logger) {
     WHERE status = 'failed' AND failed_at < ?
   `);
 
+  // Risk #1: clean expired messages older than 7 days
+  const stmtDeleteExpired = db.prepare(`
+    DELETE FROM messages
+    WHERE status = 'expired' AND expired_at < ?
+  `);
+
   const stmtExpireQueued = db.prepare(`
     UPDATE messages
     SET status = 'expired', expired_at = ?
@@ -352,6 +358,7 @@ export function initDb(stateDir, logger) {
       const delDelivered = stmtDeleteDelivered.run(sevenDaysAgo);
       const delCompleted = stmtDeleteCompleted.run(sevenDaysAgo);
       const delFailed = stmtDeleteFailed.run(sevenDaysAgo);
+      const delExpired = stmtDeleteExpired.run(sevenDaysAgo);
       const expQueued = stmtExpireQueued.run(nowIso, twentyFourHoursAgo);
       const expDeliveredTasks = stmtExpireDeliveredTasks.run(nowIso, twoHoursAgo);
       const expDeadLetter = stmtExpireDeadLetter.run(nowIso, twentyFourHoursAgo);
@@ -360,6 +367,7 @@ export function initDb(stateDir, logger) {
         deletedDelivered: delDelivered.changes,
         deletedCompleted: delCompleted.changes,
         deletedFailed: delFailed.changes,
+        deletedExpired: delExpired.changes,
         expiredQueued: expQueued.changes,
         expiredDeliveredTasks: expDeliveredTasks.changes,
         expiredDeadLetter: expDeadLetter.changes
